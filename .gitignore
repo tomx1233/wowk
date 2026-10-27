@@ -15,3 +15,6 @@ analysis/
 
 # local renders (regenerate with tools/render_example.py)
 examples/*.wav
+
+# reference audio for the pair-matching work (large, third-party material)
+refaudio/
