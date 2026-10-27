@@ -1,0 +1,54 @@
+# Validation - demo
+
+Input        demo_input.ogg  44100 Hz  2 ch  24.000000 s  (1058400 frames)
+Profile      Reference character (hypothesis)
+Stages       eq, dynamic_eq, multiband, compressor, saturation, stereo, gain_match, limiter
+
+## Timing
+input frames        1058400
+PCM render frames   1058400  (identical: True)
+encoded duration    24.000000 s  (difference +0.000000 s)
+no pitch shift / tempo change / time-stretch is present in the graph; the only difference is container padding from the codec
+
+## Levels
+                           input    render   encoded
+sample peak dBFS           -2.75     -2.37     -2.25
+true peak dBTP             -2.74     -2.37     -2.25
+RMS dBFS                  -15.51    -15.89    -15.89
+integrated LUFS           -14.21    -14.21    -14.22
+LRA LU                      5.21      4.25      4.26
+crest dB                   12.77     13.53     13.65
+envelope range dB           6.71      4.80      4.81
+L/R correlation            0.910     0.847     0.845
+S/M dB                    -13.21    -10.78    -10.73
+mono fold dB               -0.20     -0.35     -0.35
+centroid Hz                  151       194       191
+
+loudness match applied: +2.50 dB (negative means the render was attenuated)
+render is quieter than the input by 0.00 LU
+encoded true peak is within the -1.0 dBTP ceiling
+samples at full scale in the encoded file: 0.0000 %
+
+## Spectral change at matched loudness (band energy, dB)
+  sub 20-60             -4.75
+  bass 60-120           -0.69
+  lowmid 120-300        +0.45
+  mid 300-1k            +0.34
+  uppermid 1-3k         +2.93
+  presence 3-6k         +2.84
+  treble 6-10k          +4.68
+  air 10-16k            +6.51
+  top 16k+              +5.93
+
+## Stereo / mono checks
+  mono fold-down change: -0.15 dB (0 dB = mono compatibility unchanged)
+
+## Stage reports
+  {"stage": "eq", "mode": "minimum", "sections": 6}
+  {"stage": "dynamic_eq", "bands": [{"freq": 6800.0, "peak_amount": 0.35370396048923125}], "bypassed": false}
+  {"stage": "multiband", "bands": [{"max_reduction_db": -2.1327731555881666, "typical_reduction_db": -1.0840841301900102, "bypassed": false}, {"max_reduction_db": -0.7451625069763063, "typical_reduction_db": -0.059202540745041485, "bypassed": false}, {"max_reduction_db": -0.09785302369879434, "typical_reduction_db": -3.3051177616029055e-05, "bypassed": false}], "bypassed": false, "crossovers_hz": [180.0, 2400.0], "crossover": "complementary linear-phase FIR (zero net delay)", "fir_group_delays_removed": [490, 64]}
+  {"stage": "compressor", "max_reduction_db": -2.041334578783148, "typical_reduction_db": -1.208226298377585, "bypassed": false}
+  {"stage": "saturation", "bypassed": false, "shaper": "tanh", "drive_db": 4.0, "mix": 0.12, "compensation_db": -0.500846574509449, "oversample": 4}
+  {"stage": "stereo", "bypassed": false, "width": 1.1, "correlation_before": 0.8717243983859252, "correlation_after": 0.8468187764884894, "side_mid_before_db": -11.608277015385525, "side_mid_after_db": -10.780423312221025, "mono_fold_before_db": -0.2899857433645323, "mono_fold_after_db": -0.3484982120870477}
+  {"stage": "gain_match", "gain_db": 2.4998820917382876, "mode": "lufs", "target": -14.212521896725965}
+  {"stage": "limiter", "bypassed": true, "peak_ceiling_db": -1.0}

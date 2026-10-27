@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# scratch output from the analysis tools
+analysis/
+/tmp/
+.tf_export_*
+*.tmp
+
+# local renders (regenerate with tools/render_example.py)
+examples/*.wav

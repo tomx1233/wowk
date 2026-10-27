@@ -1,0 +1,180 @@
+{
+  "schema": 1,
+  "name": "Reference character (hypothesis)",
+  "description": "Broad low-end tilt, presence/air lift, level-dependent de-essing, gentle band dynamics and a 12% harmonic blend. Conservative by design: no loudness maximising, -1 dBTP. Built from reported measurements only - validate against the supplied files before trusting it.",
+  "bypass": false,
+  "eq": {
+    "mode": "minimum",
+    "fir_taps": 4097,
+    "bands": [
+      {
+        "type": "highpass",
+        "freq": 32.0,
+        "gain_db": 0.0,
+        "q": 0.707,
+        "enabled": true
+      },
+      {
+        "type": "lowshelf",
+        "freq": 110.0,
+        "gain_db": -2.8,
+        "q": 0.707,
+        "enabled": true
+      },
+      {
+        "type": "peaking",
+        "freq": 380.0,
+        "gain_db": -1.6,
+        "q": 0.85,
+        "enabled": true
+      },
+      {
+        "type": "peaking",
+        "freq": 1600.0,
+        "gain_db": 1.8,
+        "q": 0.8,
+        "enabled": true
+      },
+      {
+        "type": "highshelf",
+        "freq": 7000.0,
+        "gain_db": 3.6,
+        "q": 0.707,
+        "enabled": true
+      },
+      {
+        "type": "peaking",
+        "freq": 12000.0,
+        "gain_db": 1.6,
+        "q": 0.7,
+        "enabled": true
+      }
+    ]
+  },
+  "dynamic_eq": {
+    "enabled": true,
+    "bands": [
+      {
+        "enabled": true,
+        "freq": 6800.0,
+        "q": 1.4,
+        "gain_db": -4.0,
+        "threshold_db": -30.0,
+        "ratio": 2.2,
+        "attack_ms": 3.0,
+        "release_ms": 90.0,
+        "direction": "above",
+        "max_reduction_db": 6.0,
+        "stereo": "linked"
+      }
+    ]
+  },
+  "transient": {
+    "enabled": false,
+    "attack_db": 0.0,
+    "sustain_db": 0.0,
+    "fast_ms": 2.0,
+    "slow_ms": 40.0,
+    "sensitivity_db": 6.0
+  },
+  "multiband": {
+    "enabled": true,
+    "crossovers_hz": [
+      180.0,
+      2400.0
+    ],
+    "bands": [
+      {
+        "enabled": true,
+        "threshold_db": -22.0,
+        "ratio": 1.6,
+        "attack_ms": 25.0,
+        "release_ms": 200.0,
+        "knee_db": 8.0,
+        "detector": "rms",
+        "window_ms": 12.0,
+        "stereo": "linked",
+        "mix": 0.7,
+        "sidechain_hp_hz": 0.0,
+        "makeup_db": 0.0
+      },
+      {
+        "enabled": true,
+        "threshold_db": -21.0,
+        "ratio": 1.7,
+        "attack_ms": 18.0,
+        "release_ms": 170.0,
+        "knee_db": 8.0,
+        "detector": "rms",
+        "window_ms": 12.0,
+        "stereo": "linked",
+        "mix": 0.6,
+        "sidechain_hp_hz": 0.0,
+        "makeup_db": 0.0
+      },
+      {
+        "enabled": true,
+        "threshold_db": -26.0,
+        "ratio": 1.4,
+        "attack_ms": 10.0,
+        "release_ms": 140.0,
+        "knee_db": 8.0,
+        "detector": "rms",
+        "window_ms": 12.0,
+        "stereo": "linked",
+        "mix": 0.45,
+        "sidechain_hp_hz": 0.0,
+        "makeup_db": 0.0
+      }
+    ]
+  },
+  "compressor": {
+    "enabled": true,
+    "threshold_db": -20.0,
+    "ratio": 1.7,
+    "attack_ms": 22.0,
+    "release_ms": 210.0,
+    "knee_db": 10.0,
+    "detector": "rms",
+    "window_ms": 12.0,
+    "stereo": "linked",
+    "mix": 0.55,
+    "sidechain_hp_hz": 0.0,
+    "makeup_db": 0.0
+  },
+  "saturation": {
+    "enabled": true,
+    "shaper": "tanh",
+    "drive_db": 4.0,
+    "mix": 0.12,
+    "oversample": 4,
+    "compensate": "rms",
+    "dc_block": true
+  },
+  "stereo": {
+    "enabled": true,
+    "width": 1.1,
+    "mono_below_hz": 0.0
+  },
+  "output_trim_db": 0.0,
+  "loudness_match": true,
+  "loudness_match_mode": "lufs",
+  "limiter": {
+    "enabled": true,
+    "ceiling_db": -1.0,
+    "lookahead_ms": 6.0,
+    "release_ms": 140.0,
+    "oversample": 4
+  },
+  "stage_order": [
+    "eq",
+    "dynamic_eq",
+    "transient",
+    "multiband",
+    "compressor",
+    "saturation",
+    "stereo",
+    "trim",
+    "limiter"
+  ]
+}

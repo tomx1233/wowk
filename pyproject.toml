@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "timbreforge"
+version = "1.0.0"
+description = "Desktop audio-character processor: import, preview, export at unchanged pitch and tempo"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "soundfile>=0.12",
+    "PySide6-Essentials>=6.5",
+]
+
+[project.optional-dependencies]
+figures = ["matplotlib>=3.7"]
+monitoring = ["sounddevice>=0.4"]
+
+[project.scripts]
+timbreforge = "timbreforge.cli:main"
+timbreforge-gui = "timbreforge.gui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["timbreforge*"]
+
+[tool.setuptools.package-data]
+timbreforge = ["../profiles/*.json"]

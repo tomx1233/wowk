@@ -1,0 +1,10 @@
+# Timbreforge runtime dependencies
+numpy>=1.24
+scipy>=1.10
+soundfile>=0.12          # libsndfile bindings: WAV / FLAC / Ogg Vorbis / MP3
+PySide6-Essentials>=6.5  # Qt 6 widgets (full PySide6 also works and adds QtMultimedia)
+
+# optional, only for the analysis tools and the report figures
+matplotlib>=3.7          # tools/analyze_pair.py --figures, tools/render_example.py
+# sounddevice>=0.4       # fallback audio output if Qt Multimedia is unavailable
+
