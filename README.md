@@ -8,7 +8,22 @@ It exists to reproduce one specific goal — the *tonal and textural* character 
 the reference recording (`NewTest.ogg`) using ordinary material — **without**
 pitch, tempo or speed changes, and **without** becoming a loudness maximiser.
 
-![main window](docs/screenshot.png)
+---
+
+## What changed in 1.1 (and what was wrong in 1.0)
+
+1.0 shipped three problems the release notes did not admit to:
+
+| Symptom | Cause | Fix in 1.1 |
+|---|---|---|
+| Play did nothing on Windows | `PySide6-Essentials` was pinned, and it contains **no Qt Multimedia**, so the only playback backend that existed was missing | `sounddevice` is now a required dependency and the primary backend; Qt Multimedia is a secondary backend; if neither works the app renders the preview to a temp file and opens it in your own player ("Audition in player") |
+| The window froze after every slider move | every change re-rendered the region *and* re-measured it on the UI thread, and changes were queued instead of superseded | decoding/measuring/rendering moved to worker threads, changes are debounced (300 ms), an in-flight render is cancelled rather than queued, buffers are pre-prepared off the UI thread, and A/B gain is applied by the player so switching sides never re-renders |
+| "Too complicated" | the first screen was the full 10-stage editor | the app now opens in a **simple view** with five controls; the full editor is one click away and is loaded with the profile the simple controls generated |
+
+If 1.0's exported files did not sound like the reference, that is *not* fixed by
+1.1 and cannot be: the reference recordings were never provided, so the shipped
+profile is still an unvalidated hypothesis (see the status below). Send the four
+files and the analysis commands turn that into evidence.
 
 ---
 
@@ -49,14 +64,44 @@ python -m timbreforge
 python -m timbreforge "/path/to/song.ogg"   # open with a file loaded
 ```
 
-Packages used: `numpy`, `scipy`, `soundfile` (libsndfile), `PySide6`.
-`matplotlib` is only needed for the analysis figures. Nothing else is required —
-no Audacity, no Discord/bot configuration, no network access.
+Packages used: `numpy`, `scipy`, `soundfile` (libsndfile), `PySide6`,
+`sounddevice`. `matplotlib` is only needed for the analysis figures. Nothing else
+is required — no Audacity, no Discord/bot configuration, no network access.
 
-Audio monitoring: the app uses Qt Multimedia when the PySide6 build provides it,
-falls back to `sounddevice`, and if neither is available it says so and keeps
-working (rendering, measurement and export are unaffected). On a bare Linux box
-install `libportaudio2` (for sounddevice) or use a full PySide6 wheel.
+### Audio output
+
+Playback tries three backends, in this order:
+
+1. **`sounddevice`** (PortAudio). This is the normal path and the reason it is a
+   required dependency: the wheel bundles PortAudio on Windows and macOS.
+2. **Qt Multimedia**, if the installed PySide6 build contains it. Note that
+   `PySide6-Essentials` — which earlier versions of this project pinned — does
+   **not** include Qt Multimedia, so this backend simply did not exist there.
+   That was the cause of "play plays nothing" on Windows.
+3. **None.** The app then shows an *Audition in player* button (also
+   `View ▸ Audition preview in system player`, Ctrl+Shift+P): it renders the
+   preview region to a temporary WAV and opens it in your system's audio player.
+   Rendering, measurement and export never depend on an audio device.
+
+Check the current backend any time in the status line, or with
+`View ▸ Test audio output`.
+
+If playback is still silent:
+
+```bash
+python -c "import sounddevice as sd; print(sd.query_devices()); print(sd.default.device)"
+```
+
+* **prints a traceback** → PortAudio is missing. `pip install --force-reinstall sounddevice`
+  (Windows/macOS wheels bundle it); on Debian/Ubuntu also `sudo apt install libportaudio2`.
+* **lists devices but the wrong one is default** → choose the right output device
+  in the OS sound settings; the app follows the system default.
+* **device busy / sample-rate error** → close other apps that hold the device in
+  exclusive mode, or select a different default device. The app negotiates the
+  device's supported rate and resamples for monitoring only — the exported file
+  always keeps the input's sample rate.
+* **Windows + Bluetooth headset** → those often expose only a "hands-free"
+  profile; pick the stereo output device in Windows settings.
 
 ---
 
@@ -64,7 +109,9 @@ install `libportaudio2` (for sounddevice) or use a full PySide6 wheel.
 
 1. **Import** — `File ▸ Import` (Ctrl+O), drag a file onto the window, or pass it
    on the command line. WAV, FLAC, Ogg Vorbis and MP3 are supported through
-   libsndfile (ffmpeg is used as a fallback decoder if installed).
+   libsndfile (ffmpeg is used as a fallback decoder if installed). Decoding and
+   measuring happen on a worker thread, so the window stays responsive and the
+   Cancel button works.
 2. **Preview** — the render happens on a worker thread. Files longer than 45 s
    preview a 30 s window around the playhead (tick *Preview whole file* to render
    everything). Drag on the waveform to select a region; double-click clears it.
@@ -73,9 +120,27 @@ install `libportaudio2` (for sounddevice) or use a full PySide6 wheel.
    losing the playhead. *Level-match A/B* attenuates the louder side (never
    boosts) so the comparison is honest. `Bypass` in the profile panel renders
    the input through the same path for a bit-identical reference.
-4. **Adjust** — every control edits one parameter of the one processing graph
-   (see below). Re-renders are debounced; the status line lists the active
-   stages and any level-matching applied.
+4. **Adjust** — the app opens in the **simple view**, five controls:
+
+   | Control | What it does |
+   |---|---|
+   | Character | overall amount: tone shaping, level-dependent brightness, gentle dynamics, a little harmonic texture. 0 % renders neutral. |
+   | Tone | −100 darker/fuller … +100 brighter/leaner |
+   | Tightness | how much the dynamics are controlled (0 % leaves them alone) |
+   | Air | extra top-end lift on top of Character |
+   | Output | extra gain on top of the automatic level match (leave at 0) |
+
+   The four *Starting points* buttons (Subtle → Maximum) are quick presets, and
+   each slider's tooltip explains what it changes. These five controls do **not**
+   form a second DSP path: they deterministically generate a complete profile
+   (see `timbreforge/dsp/graph.py::profile_from_simple`), which the same engine
+   renders. *Advanced view* loads that generated profile into the full editor, so
+   the two views can never disagree about what you are hearing.
+
+   Every control edits one parameter of the one processing graph (see below).
+   Re-renders are debounced (~300 ms) and an older render is cancelled rather
+   than queued; the status line lists the active stages, any level-matching
+   applied, and the headroom left below the ceiling.
 5. **Export** — `Export…` (Ctrl+E) picks format, bit depth/quality, sample rate
    and destination, renders the **whole** file with the same engine, then
    re-decodes the written file and reports timing, true peak, loudness, crest,
@@ -85,7 +150,10 @@ install `libportaudio2` (for sounddevice) or use a full PySide6 wheel.
    Three are shipped in `profiles/`:
    * `neutral_level_matched.json` — no processing, level matched, −1 dBTP
    * `gentle_character.json` — broad tilt + one soft compressor
-   * `reference_character.json` — the hypothesis (loaded at startup)
+   * `reference_character.json` — the hypothesis. Load it with
+     `File ▸ Processing ▸ Load`, by pointing `TIMBREFORGE_PROFILE` at it, or from
+     the preset list. It is *not* loaded at startup any more: the app now starts
+     in the simple view.
 
 ---
 
@@ -170,12 +238,26 @@ What the analysis reports, and why each part exists:
 ```bash
 python tests/test_dsp.py          # graph invariants (pitch/length, loudness, limiter, stereo, export)
 python tests/test_analyze.py      # analysis recovers a known lag, EQ, compression, pitch error
-python tests/test_gui_smoke.py    # headless UI: import, render, A/B, export, close
+python tests/test_playback.py     # playback buffers, device negotiation, import/export limits, simple controls
+python tests/test_gui_sim.py      # the real window + workers, run against a stand-in Qt (no display needed)
+python tests/test_gui_smoke.py    # the real window with the real Qt (needs a display or offscreen platform)
+python tools/check_qt_api.py      # static check of every Qt call against the PySide6 stubs
+python tools/check_wiring.py      # every attribute the window uses on the panel/player/workers exists
 ```
 
-`test_gui_smoke.py` needs a display or `QT_QPA_PLATFORM=offscreen`. On a machine
-without the Qt platform libraries (missing libGL/libEGL/libDBus) the GUI tests
-cannot run at all — that is an environment limit, not an app failure.
+`test_playback.py` deliberately imports no Qt, so it runs anywhere numpy does.
+`test_gui_sim.py` does import Qt — a small stand-in in `tests/fakeqt/PySide6` that
+keeps widget construction, signal delivery, `QThread.start()` (running `run()`
+inline) and a fake PortAudio stream, and no-ops everything visual. Everything
+below the GUI is the real code, so it exercises import → render → apply → A/B →
+export end to end. It cannot tell you whether the window *looks* right.
+`test_gui_smoke.py` needs a display or `QT_QPA_PLATFORM=offscreen`; the
+development sandbox this release was built in has no Qt platform libraries at all
+(no libGL/libEGL/libxkbcommon/ICU), so the GUI could not be executed there. As a
+substitute, `tools/check_qt_api.py` parses the shipped PySide6 `.pyi` stubs and
+verifies every class, method, property and enum member the GUI touches exists.
+A clean run means "no known-bad Qt call", not "the window was seen rendering" —
+run the smoke test on your own machine if you want the latter.
 
 ---
 

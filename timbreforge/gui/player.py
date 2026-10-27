@@ -1,301 +1,376 @@
-"""Playback engine used for A/B auditioning.
+"""Playback with an explicit backend order and *no* work on the UI thread.
 
-Two interchangeable backends:
+Backends
+--------
+1. ``sounddevice`` (PortAudio).  Preferred, because the wheel bundles PortAudio on
+   Windows and macOS, and it accepts float32 buffers at the device's native rate.
+2. ``Qt Multimedia`` (``QAudioSink``), used when sounddevice is missing but a full
+   PySide6 build is installed.  Note that ``PySide6-Essentials`` does **not**
+   contain Qt Multimedia - that was the reason playback silently did nothing on
+   Windows.
+3. none - the UI then offers "Audition in player", which renders the preview to a
+   temporary file and opens it in the system's own audio player.  That path never
+   depends on Python audio bindings at all.
 
-* ``qt``  - QAudioSink from Qt Multimedia (present in a full PySide6 install).
-* ``sd``  - python-sounddevice, used when Qt Multimedia is unavailable.
-* ``none``- no audio output in this environment; the rest of the app still works
-            and the UI says so instead of failing silently.
-
-Playback only ever resamples for the *output device*; exported audio and the
-render graph always keep the source sample rate.
+Everything a backend needs is prepared *before* ``play()``: the source audio is
+converted once into the device's format by
+:func:`timbreforge.dsp.playback.prepare_playback`, so the audio callback only
+copies bytes.
 """
 
 from __future__ import annotations
 
-import threading
+import os
+import platform
+import subprocess
+import weakref
 
 import numpy as np
-from PySide6.QtCore import QObject, QIODevice, Signal
+from PySide6.QtCore import QIODevice, QObject, Qt, QTimer, Signal
 
-from ..dsp.audio import resample_same_speed
+from ..dsp.playback import DeviceFormat, PlaybackBuffer, prepare_playback, test_tone
 
 
 class AudioPlayer(QObject):
-    positionChanged = Signal(float)
-    stateChanged = Signal(str)      # "playing" | "paused" | "stopped"
-    playbackError = Signal(str)
-    finished = Signal()
+    """Streams a :class:`PlaybackBuffer` to the default output device."""
 
-    FADE_FRAMES = 256
+    playbackError = Signal(str)
+    stateChanged = Signal(str)          # "playing" | "paused" | "stopped"
+    positionChanged = Signal(float)     # seconds into the installed buffer
+    finished = Signal()
+    backendChanged = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._buffer: np.ndarray | None = None   # float32 (frames, channels)
-        self._prev: np.ndarray | None = None
-        self._fade = 0
-        self._sr = 44100
-        self._pos = 0
+        self._backend = "none"
+        self._backend_detail = "no audio output available"
+        self._fmt = DeviceFormat()
+        self._sd = None
+        self._sd_stream = None
+        self._device_index: int | None = None
+        self._buffer: PlaybackBuffer | None = None
+        self._byte_pos = 0
         self._playing = False
         self._state = "stopped"
-        self._backend = "none"
-        self._name = "no audio output"
-        self._dev_sr = 44100
-        self._dev_ch = 2
-        self._lock = threading.Lock()
         self._qt_sink = None
         self._qt_source = None
-        self._sd_stream = None
-        self._sd_frames_per_block = 1024
-        self._setup_backend()
+        self._tone: PlaybackBuffer | None = None
+        self._gain_db = 0.0
+        self._gain_linear = 1.0
+        self._pos_timer = QTimer(self)
+        self._pos_timer.setInterval(40)
+        self._pos_timer.timeout.connect(self._emit_position)
+        self._detect_backend()
 
-    # -- backend selection ------------------------------------------------
-    def _setup_backend(self):
+    # ------------------------------------------------------------------
+    # backend detection
+    # ------------------------------------------------------------------
+    def _detect_backend(self):
+        errors: list[str] = []
         try:
-            from PySide6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
+            import sounddevice as sd  # noqa: F401
+            self._sd = sd
+            info = sd.query_devices(kind="output")
+            self._device_index = None
+            self._backend = "sd"
+            self._backend_detail = f"sounddevice / PortAudio ({info.get('name', 'default')})"
+            self._fmt = self._best_sd_format(44100, 2)
+            self.backendChanged.emit()
+            return
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"sounddevice: {exc}")
+
+        try:
+            from PySide6.QtMultimedia import QAudioFormat, QMediaDevices
             dev = QMediaDevices.defaultAudioOutput()
             if dev is not None and not dev.isNull():
-                fmt = QAudioFormat()
-                fmt.setSampleRate(48000)
-                fmt.setChannelCount(2)
-                fmt.setSampleFormat(QAudioFormat.SampleFormat.Float)
-                if not dev.isFormatSupported(fmt):
-                    fmt = dev.preferredFormat()
-                if fmt.isValid() and fmt.sampleRate() > 0:
-                    self._backend = "qt"
-                    self._name = f"Qt Multimedia ({dev.description()})"
-                    self._dev_sr = int(fmt.sampleRate())
-                    self._dev_ch = max(1, int(fmt.channelCount()))
-                    self._qt_fmt = fmt
-                    return
-        except Exception:  # noqa: BLE001 - optional dependency
-            pass
-        try:
-            import sounddevice as sd
-            info = sd.query_devices(kind="output")
-            self._dev_sr = int(info.get("default_samplerate", 44100))
-            self._dev_ch = 2
-            self._backend = "sd"
-            self._name = f"sounddevice ({info.get('name', 'output')})"
-            return
-        except Exception:  # noqa: BLE001
-            pass
-        self._backend = "none"
-        self._name = "no audio output available"
-        self._dev_sr = 44100
-        self._dev_ch = 2
+                self._backend = "qt"
+                self._backend_detail = f"Qt Multimedia ({dev.description()})"
+                self._fmt = self._best_qt_format(44100, 2)
+                self.backendChanged.emit()
+                return
+            errors.append("Qt Multimedia: no default output device")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"Qt Multimedia: {exc}")
 
+        self._backend = "none"
+        self._backend_detail = ("no audio output backend "
+                                "(" + "; ".join(errors) + ")")
+        self.backendChanged.emit()
+
+    # -- format negotiation ------------------------------------------------
+    def _best_sd_format(self, source_rate: int, channels: int) -> DeviceFormat:
+        sd = self._sd
+        want_ch = min(2, max(1, channels))
+        candidates = [DeviceFormat(source_rate, want_ch, "float32"),
+                      DeviceFormat(48000, 2, "float32"),
+                      DeviceFormat(44100, 2, "float32")]
+        for fmt in candidates:
+            try:
+                sd.check_output_settings(device=self._device_index,
+                                         samplerate=fmt.sample_rate,
+                                         channels=fmt.channels,
+                                         dtype=fmt.dtype)
+                return fmt
+            except Exception:  # noqa: BLE001
+                continue
+        try:
+            info = sd.query_devices(kind="output")
+            return DeviceFormat(int(info.get("default_samplerate", 44100)),
+                                min(2, int(info.get("max_output_channels", 2))),
+                                "float32")
+        except Exception:  # noqa: BLE001
+            return DeviceFormat(44100, 2, "float32")
+
+    def _best_qt_format(self, source_rate: int, channels: int) -> DeviceFormat:
+        from PySide6.QtMultimedia import QAudioFormat, QMediaDevices
+        dev = QMediaDevices.defaultAudioOutput()
+        want_ch = min(2, max(1, channels))
+        for dtype in ("float32", "int16", "int32"):
+            for rate in (source_rate, 48000, 44100):
+                probe = QAudioFormat()
+                probe.setSampleRate(int(rate))
+                probe.setChannelCount(int(want_ch))
+                probe.setSampleFormat(self._qt_sample_format(dtype))
+                if probe.isValid() and dev.isFormatSupported(probe):
+                    return DeviceFormat(int(rate), int(want_ch), dtype)
+        pref = dev.preferredFormat()
+        dtype = {QAudioFormat.SampleFormat.Float: "float32",
+                 QAudioFormat.SampleFormat.Int16: "int16",
+                 QAudioFormat.SampleFormat.Int32: "int32"}.get(
+                     pref.sampleFormat(), "int16")
+        return DeviceFormat(int(pref.sampleRate() or 44100),
+                            int(pref.channelCount() or 2), dtype)
+
+    @staticmethod
+    def _qt_sample_format(dtype: str):
+        from PySide6.QtMultimedia import QAudioFormat
+        return {"float32": QAudioFormat.SampleFormat.Float,
+                "int16": QAudioFormat.SampleFormat.Int16,
+                "int32": QAudioFormat.SampleFormat.Int32}[dtype]
+
+    def configure_source(self, source_rate: int, channels: int):
+        """Pick a device format for a newly imported file (cheap, no I/O)."""
+        if self._backend == "sd" and self._sd is not None:
+            self._fmt = self._best_sd_format(source_rate, channels)
+        elif self._backend == "qt":
+            try:
+                self._fmt = self._best_qt_format(source_rate, channels)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ------------------------------------------------------------------
+    # public state
+    # ------------------------------------------------------------------
     @property
     def available(self) -> bool:
         return self._backend != "none"
 
     @property
+    def backend(self) -> str:
+        return self._backend
+
+    @property
     def backend_name(self) -> str:
-        return self._name
+        return self._backend_detail
 
-    # -- public API -------------------------------------------------------
-    def set_buffer(self, audio: np.ndarray | None, sr: int, *, keep_position: bool = True):
-        """Swap the buffer being auditioned (used for A/B), keeping the playhead."""
-        was_playing = self._playing
-        if keep_position and self._buffer is not None:
-            with self._lock:
-                self._prev = self._buffer
-                self._fade = self.FADE_FRAMES
-        else:
-            with self._lock:
-                self._prev = None
-                self._fade = 0
-        if audio is None:
-            self.stop()
-            self._buffer = None
-            return
-        prepared = self._prepare(audio, sr)
-        with self._lock:
-            self._buffer = prepared
-            self._sr = sr
-        if self._pos >= prepared.shape[0]:
-            self._pos = 0
-        if was_playing:
-            self.play(self._pos / float(self._dev_sr), restart=True)
-
-    def _prepare(self, audio: np.ndarray, sr: int) -> np.ndarray:
-        x = np.asarray(audio, dtype=np.float64)
-        if x.ndim == 1:
-            x = x[:, None]
-        if x.shape[1] != self._dev_ch:
-            if x.shape[1] > self._dev_ch:
-                x = x[:, : self._dev_ch]
-            else:
-                reps = int(np.ceil(self._dev_ch / x.shape[1]))
-                x = np.repeat(x, reps, axis=1)[:, : self._dev_ch]
-        if sr != self._dev_sr:
-            x = resample_same_speed(x, sr, self._dev_sr)
-        x = np.clip(x, -1.0, 1.0)
-        return np.ascontiguousarray(x, dtype=np.float32)
+    @property
+    def device_format(self) -> DeviceFormat:
+        return self._fmt
 
     def duration(self) -> float:
-        if self._buffer is None:
-            return 0.0
-        return self._buffer.shape[0] / float(self._dev_sr)
+        return self._buffer.duration if self._buffer else 0.0
 
     def position(self) -> float:
-        return self._pos / float(self._dev_sr)
+        if not self._buffer or not self._fmt.sample_rate:
+            return 0.0
+        return (self._byte_pos / self._fmt.bytes_per_frame) / float(self._fmt.sample_rate)
 
     def is_playing(self) -> bool:
         return self._playing
 
-    def play(self, from_s: float | None = None, *, restart: bool = False):
-        if self._buffer is None:
+    @property
+    def buffer(self) -> PlaybackBuffer | None:
+        """The buffer currently installed (already in the device format)."""
+        return self._buffer
+
+    def set_gain_db(self, gain_db: float):
+        """Instant A/B attenuation, applied in the read path.
+
+        Only attenuation is used by the UI (level-matched A/B), so this cannot
+        silently make monitoring louder than the rendered file.
+        """
+        g = float(min(0.0, gain_db))
+        self._gain_db = g
+        self._gain_linear = 10.0 ** (g / 20.0)
+
+    def gain_db(self) -> float:
+        return self._gain_db
+
+    def _emit_position(self):
+        if self._playing:
+            self.positionChanged.emit(self.position())
+
+    # ------------------------------------------------------------------
+    # buffer handling
+    # ------------------------------------------------------------------
+    def set_buffer(self, buffer: PlaybackBuffer | None, *, keep_position: bool = True,
+                   fade_in: bool = True, gain_db: float | None = None):
+        """Install a prepared buffer.  Cheap: no audio processing happens here."""
+        was_playing = self._playing
+        pos_s = self.position() if keep_position else 0.0
+        if gain_db is not None:
+            self.set_gain_db(gain_db)
+        if buffer is not None and fade_in and was_playing:
+            # re-render the first milliseconds with a ramp so the swap is silent
+            buffer = self._with_ramp(buffer)
+        if was_playing:
+            self._stop_backend()
+        self._buffer = buffer
+        if buffer is None:
+            self._byte_pos = 0
+            self._set_state("stopped")
             return
-        if from_s is not None:
-            self._pos = int(np.clip(from_s * self._dev_sr, 0,
-                                    max(0, self._buffer.shape[0] - 1)))
+        self._byte_pos = int(np.clip(pos_s * self._fmt.sample_rate, 0,
+                                     max(0, buffer.frames - 1))) * self._fmt.bytes_per_frame
+        if was_playing:
+            self._start_backend()
+
+    @staticmethod
+    def _with_ramp(buffer: PlaybackBuffer) -> PlaybackBuffer:
+        frames = min(int(buffer.format.sample_rate * 0.008), buffer.frames)
+        if frames < 2:
+            return buffer
+        arr = buffer.as_array()
+        ramp = np.linspace(0.0, 1.0, frames, dtype=np.float32)[:, None]
+        arr[:frames] *= ramp
+        from ..dsp.playback import _to_dtype  # local import: internal helper
+        return PlaybackBuffer(data=_to_dtype(arr, buffer.format.dtype).tobytes(),
+                              format=buffer.format, source_rate=buffer.source_rate,
+                              source_frames=buffer.source_frames,
+                              resampled=buffer.resampled, gain_db=buffer.gain_db)
+
+    # ------------------------------------------------------------------
+    # transport
+    # ------------------------------------------------------------------
+    def play(self, from_seconds: float | None = None):
+        if self._buffer is None or not self.available:
+            return
+        if from_seconds is not None:
+            self._byte_pos = int(np.clip(from_seconds * self._fmt.sample_rate, 0,
+                                         max(0, self._buffer.frames - 1))
+                                 ) * self._fmt.bytes_per_frame
         self._playing = True
         self._set_state("playing")
-        if self._backend == "qt":
-            self._qt_start()
-        elif self._backend == "sd":
-            self._sd_start()
+        self._pos_timer.start()
+        self._start_backend()
 
     def pause(self):
+        self._stop_backend()
         self._playing = False
-        if self._backend == "qt":
-            self._qt_stop_sink(keep_pos=True)
-        elif self._backend == "sd":
-            self._sd_stop_stream()
+        self._pos_timer.stop()
         self._set_state("paused")
 
     def stop(self):
+        self._stop_backend()
         self._playing = False
-        self._pos = 0
-        if self._backend == "qt":
-            self._qt_stop_sink(keep_pos=True)
-        elif self._backend == "sd":
-            self._sd_stop_stream()
+        self._byte_pos = 0
+        self._pos_timer.stop()
         self._set_state("stopped")
-        self.positionChanged.emit(0.0)
 
     def seek(self, seconds: float):
         if self._buffer is None:
             return
-        self._pos = int(np.clip(seconds * self._dev_sr, 0,
-                                max(0, self._buffer.shape[0] - 1)))
-        if self._playing:
-            self.play(self.position(), restart=True)
-        else:
-            self.positionChanged.emit(self.position())
+        was = self._playing
+        self._stop_backend()
+        self._byte_pos = int(np.clip(seconds * self._fmt.sample_rate, 0,
+                                     max(0, self._buffer.frames - 1))
+                             ) * self._fmt.bytes_per_frame
+        if was:
+            self._start_backend()
 
     def shutdown(self):
+        self._stop_backend()
+        self._pos_timer.stop()
         self._playing = False
-        if self._backend == "qt":
-            self._qt_stop_sink(keep_pos=False)
-        elif self._backend == "sd":
-            self._sd_stop_stream()
 
     def _set_state(self, s: str):
         if s != self._state:
             self._state = s
             self.stateChanged.emit(s)
 
-    # -- shared sample reading -------------------------------------------
-    def _read_chunk(self, frames: int) -> tuple[np.ndarray, bool]:
-        """Return the next ``frames`` samples and whether the end was reached."""
-        with self._lock:
-            buf = self._buffer
-            if buf is None:
-                return np.zeros((frames, self._dev_ch), dtype=np.float32), True
-            start = self._pos
-            end = min(buf.shape[0], start + frames)
-            chunk = np.array(buf[start:end], dtype=np.float32)
-            if self._fade > 0 and self._prev is not None:
-                prev = self._prev
-                n = min(self._fade, chunk.shape[0], max(0, prev.shape[0] - start))
-                if n > 0:
-                    w = np.linspace(1.0, 0.0, self._fade, endpoint=False,
-                                    dtype=np.float32)[:n]
-                    chunk[:n] = chunk[:n] * (1 - w)[:, None] + prev[start:start + n] * w[:, None]
-                self._fade = max(0, self._fade - chunk.shape[0])
-                if self._fade == 0:
-                    self._prev = None
-            self._pos = end
-            done = end >= buf.shape[0]
-        if chunk.shape[0] < frames:
-            pad = np.zeros((frames - chunk.shape[0], self._dev_ch), dtype=np.float32)
-            chunk = np.concatenate([chunk, pad], axis=0)
+    # ------------------------------------------------------------------
+    # chunk reading (shared by both backends)
+    # ------------------------------------------------------------------
+    def _read_frames(self, frames: int) -> tuple[bytes, bool]:
+        if self._buffer is None:
+            return b"", True
+        want = self._fmt.frames_to_bytes(max(1, frames))
+        chunk = self._buffer.read(self._byte_pos, want)
+        if chunk and self._gain_linear != 1.0:
+            arr = np.frombuffer(chunk, dtype=self._fmt.dtype).astype(np.float32)
+            arr *= np.float32(self._gain_linear)
+            chunk = np.clip(arr, -1.0, 1.0).astype(self._fmt.dtype).tobytes()
+        self._byte_pos += len(chunk)
+        done = self._byte_pos >= len(self._buffer.data)
+        if done:
+            self._playing = False
         return chunk, done
 
-    def _notify_position(self):
-        self.positionChanged.emit(self.position())
-        if self._buffer is not None and self._pos >= self._buffer.shape[0]:
-            self._playing = False
-            if self._backend == "qt":
-                self._qt_stop_sink(keep_pos=True)
-            elif self._backend == "sd":
-                self._sd_stop_stream()
-            self._set_state("stopped")
-            self.finished.emit()
+    def _notify_finished(self):
+        self._pos_timer.stop()
+        self._set_state("stopped")
+        self.finished.emit()
 
-    # -- Qt backend -------------------------------------------------------
-    def _qt_start(self):
-        try:
-            from PySide6.QtMultimedia import QAudioSink
-        except Exception as exc:  # noqa: BLE001
-            self.playbackError.emit(f"Qt Multimedia unavailable: {exc}")
-            self._playing = False
+    # ------------------------------------------------------------------
+    # sounddevice backend
+    # ------------------------------------------------------------------
+    def _start_backend(self):
+        if self._backend == "sd":
+            self._start_sd()
+        elif self._backend == "qt":
+            self._start_qt()
+
+    def _stop_backend(self):
+        self._stop_sd()
+        self._stop_qt()
+
+    def _start_sd(self):
+        if self._sd is None:
             return
-        self._qt_stop_sink(keep_pos=True)
-        try:
-            sink = QAudioSink(self._qt_fmt)
-            sink.setBufferSize(max(4096, int(self._dev_sr * 0.15) * self._dev_ch * 4))
-            source = _QtSource(self)
-            source.open(QIODevice.ReadOnly)
-            sink.start(source)
-            self._qt_sink = sink
-            self._qt_source = source
-        except Exception as exc:  # noqa: BLE001
-            self.playbackError.emit(f"Could not start audio output: {exc}")
-            self._playing = False
-            self._set_state("stopped")
-
-    def _qt_stop_sink(self, keep_pos: bool):
-        try:
-            if self._qt_sink is not None:
-                self._qt_sink.stop()
-                self._qt_sink.deleteLater()
-        except Exception:  # noqa: BLE001
-            pass
-        self._qt_sink = None
-        self._qt_source = None
-
-    # -- sounddevice backend ---------------------------------------------
-    def _sd_start(self):
-        try:
-            import sounddevice as sd
-        except Exception as exc:  # noqa: BLE001
-            self.playbackError.emit(f"sounddevice unavailable: {exc}")
-            self._playing = False
-            return
-        self._sd_stop_stream()
+        self._stop_sd()
+        fps_bytes = self._fmt.bytes_per_frame
+        block = 1024
+        player_ref = weakref.ref(self)
 
         def callback(outdata, frames, time_info, status):  # noqa: ANN001
-            try:
-                chunk, _ = self._read_chunk(frames)
-                outdata[:] = chunk
-            except Exception:  # noqa: BLE001
+            player = player_ref()
+            if player is None or not player._playing:
                 outdata.fill(0)
+                return
+            data, done = player._read_frames(frames)
+            buf = np.frombuffer(data, dtype=np.uint8)
+            n = len(buf) // fps_bytes
+            out = np.frombuffer(outdata, dtype=np.uint8)
+            out[: n * fps_bytes] = buf[: n * fps_bytes]
+            if n < frames:
+                out[n * fps_bytes:] = 0
+            if done:
+                QTimer.singleShot(0, player._notify_finished)
 
         try:
-            stream = sd.OutputStream(samplerate=self._dev_sr, channels=self._dev_ch,
-                                     dtype="float32", callback=callback,
-                                     blocksize=self._sd_frames_per_block)
+            stream = self._sd.OutputStream(
+                samplerate=self._fmt.sample_rate, channels=self._fmt.channels,
+                dtype=self._fmt.dtype, blocksize=block, callback=callback,
+                device=self._device_index)
             stream.start()
             self._sd_stream = stream
         except Exception as exc:  # noqa: BLE001
-            self.playbackError.emit(f"Could not open audio output: {exc}")
+            self.playbackError.emit(f"Could not open the audio output: {exc}")
             self._playing = False
             self._set_state("stopped")
 
-    def _sd_stop_stream(self):
+    def _stop_sd(self):
         if self._sd_stream is not None:
             try:
                 self._sd_stream.stop()
@@ -304,33 +379,119 @@ class AudioPlayer(QObject):
                 pass
             self._sd_stream = None
 
+    # ------------------------------------------------------------------
+    # Qt Multimedia backend
+    # ------------------------------------------------------------------
+    def _start_qt(self):
+        try:
+            from PySide6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
+        except Exception as exc:  # noqa: BLE001
+            self.playbackError.emit(f"Qt Multimedia unavailable: {exc}")
+            self._playing = False
+            return
+        self._stop_qt()
+        probe = QAudioFormat()
+        probe.setSampleRate(int(self._fmt.sample_rate))
+        probe.setChannelCount(int(self._fmt.channels))
+        probe.setSampleFormat(self._qt_sample_format(self._fmt.dtype))
+        try:
+            device = QMediaDevices.defaultAudioOutput()
+            sink = QAudioSink(device, probe, self)
+            sink.setBufferSize(max(8192, int(self._fmt.sample_rate * 0.2)
+                                   * self._fmt.bytes_per_frame))
+            sink.stateChanged.connect(self._qt_state_changed)
+            source = _QtSource(self)
+            if not source.open(QIODevice.OpenModeFlag.ReadOnly):
+                self.playbackError.emit("Could not open the playback stream.")
+                self._playing = False
+                return
+            sink.start(source)
+            self._qt_sink = sink
+            self._qt_source = source
+        except Exception as exc:  # noqa: BLE001
+            self.playbackError.emit(f"Could not start Qt audio output: {exc}")
+            self._playing = False
+            self._set_state("stopped")
+
+    def _qt_state_changed(self, state):
+        try:
+            from PySide6.QtMultimedia import QAudio
+            if state == QAudio.State.StoppedState and self._playing:
+                if self._qt_sink is not None and self._qt_sink.error() != QAudio.Error.NoError:
+                    self.playbackError.emit(
+                        f"Qt audio device error: {self._qt_sink.error()}")
+                self._playing = False
+                self._notify_finished()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _stop_qt(self):
+        try:
+            if self._qt_sink is not None:
+                self._qt_sink.stop()
+                self._qt_sink.deleteLater()
+        except Exception:  # noqa: BLE001
+            pass
+        self._qt_sink = None
+        if self._qt_source is not None:
+            try:
+                self._qt_source.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._qt_source = None
+
+    # ------------------------------------------------------------------
+    # diagnostics / fallbacks
+    # ------------------------------------------------------------------
+    def play_test_tone(self) -> bool:
+        """Play a 1 s tone through the current backend; returns False on failure."""
+        if not self.available:
+            return False
+        tone = test_tone(self._fmt)
+        self._tone = tone
+        self.set_buffer(tone, keep_position=False, fade_in=False)
+        self.play(0.0)
+        return True
+
+    def open_in_system_player(self, path: str) -> bool:
+        """Hand a rendered file to the OS.  Used when no backend exists."""
+        try:
+            system = platform.system()
+            if system == "Windows":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif system == "Darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def prepare(self, x: np.ndarray, source_rate: int, *,
+                gain_db: float = 0.0) -> PlaybackBuffer:
+        """Convert audio for this device (safe to call from a worker thread)."""
+        return prepare_playback(x, source_rate, self._fmt, gain_db=gain_db)
+
 
 class _QtSource(QIODevice):
-    """Pull-mode source device fed from the numpy buffer."""
+    """Pull-mode source: returns raw bytes straight from the prepared buffer."""
 
     def __init__(self, player: AudioPlayer):
         super().__init__()
         self._player = player
-        self._bytes_per_frame = player._dev_ch * (
-            4 if player._qt_fmt.sampleFormat().name == "Float" else 2)
 
     def readData(self, maxlen: int) -> bytes:  # noqa: N802
-        if not self._player._playing:
-            return b"\x00" * int(maxlen)
-        frames = max(1, int(maxlen) // self._bytes_per_frame)
-        chunk, done = self._player._read_chunk(frames)
-        if self._player._qt_fmt.sampleFormat().name == "Float":
-            data = chunk.astype(np.float32, copy=False).tobytes()
-        else:
-            data = (np.clip(chunk, -1, 1) * 32767.0).astype(np.int16).tobytes()
+        data, done = self._player._read_frames(
+            self._player.device_format.bytes_to_frames(maxlen))
         if done:
-            self._player._playing = False
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(0, self._player._notify_position)
-        else:
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(0, self._player._notify_position)
+            QTimer.singleShot(0, self._player._notify_finished)
         return data
 
     def bytesAvailable(self) -> int:  # noqa: N802
-        return 1 << 20
+        buf = self._player._buffer
+        if buf is None:
+            return 0
+        return max(0, len(buf.data) - self._player._byte_pos)
+
+    def writeData(self, data) -> int:  # noqa: N802
+        return 0

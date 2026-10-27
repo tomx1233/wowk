@@ -477,6 +477,125 @@ def preset_reference_hypothesis() -> Profile:
     return p
 
 
+@dataclass
+class SimpleSettings:
+    """The five controls of the simple interface.
+
+    These are *not* an alternative DSP path: they deterministically generate a
+    :class:`Profile`, which is then rendered by the same engine as everything
+    else.  Switching to the advanced view loads the generated profile, so what
+    you hear is always exactly what the visible parameters say.
+    """
+
+    character: float = 55.0      # 0 = neutral, 100 = full effect
+    tone: float = 0.0            # -100 darker .. +100 brighter
+    tightness: float = 35.0      # 0 = untouched dynamics .. 100 = controlled
+    air: float = 25.0            # 0 = none .. 100 = extra top-end lift
+    output_trim_db: float = 0.0
+    ceiling_db: float = -1.0
+
+    def clamped(self) -> "SimpleSettings":
+        return SimpleSettings(
+            character=float(np.clip(self.character, 0.0, 100.0)),
+            tone=float(np.clip(self.tone, -100.0, 100.0)),
+            tightness=float(np.clip(self.tightness, 0.0, 100.0)),
+            air=float(np.clip(self.air, 0.0, 100.0)),
+            output_trim_db=float(np.clip(self.output_trim_db, -24.0, 24.0)),
+            ceiling_db=float(np.clip(self.ceiling_db, -6.0, -0.1)),
+        )
+
+
+def profile_from_simple(settings: SimpleSettings) -> Profile:
+    """Turn the five simple controls into a complete profile.
+
+    Everything scales from zero, so character 0 / air 0 / tightness 0 is a
+    genuinely neutral render (only the loudness match and the limiter act).
+    Magnitudes are capped so that no single control can make the result harsh.
+    """
+    s = settings.clamped()
+    c = s.character / 100.0
+    tone = s.tone / 100.0
+    tight = s.tightness / 100.0
+    air = s.air / 100.0
+
+    p = Profile()
+    p.name = f"Character {s.character:.0f}%"
+    p.description = (
+        f"Simple controls: character {s.character:.0f}%, tone {s.tone:+.0f}, "
+        f"tightness {s.tightness:.0f}, air {s.air:.0f}. Generated profile - open the "
+        "advanced view to see and edit every value.")
+
+    # -- tone ------------------------------------------------------------
+    # character lifts the upper mids and above; tone tilts the whole balance
+    low = -2.4 * c + 3.0 * tone
+    high = 2.4 * c + 3.0 * tone + 3.6 * air
+    low = float(np.clip(low, -6.0, 6.0))
+    high = float(np.clip(high, -6.0, 9.0))
+    lowmid = float(np.clip(-1.2 * c + 1.0 * tone, -4.0, 4.0))
+    presence = float(np.clip(1.5 * c + 1.5 * tone, -4.0, 5.0))
+    p.eq_bands = [Band("highpass", 30.0, 0.0, 0.707)]
+    if abs(low) > 0.05:
+        p.eq_bands.append(Band("lowshelf", 120.0, round(low, 2), 0.707))
+    if abs(lowmid) > 0.05:
+        p.eq_bands.append(Band("peaking", 380.0, round(lowmid, 2), 0.85))
+    if abs(presence) > 0.05:
+        p.eq_bands.append(Band("peaking", 1600.0, round(presence, 2), 0.8))
+    if abs(high) > 0.05:
+        p.eq_bands.append(Band("highshelf", 7000.0, round(high, 2), 0.707))
+
+    # -- level-dependent HF control --------------------------------------
+    if c > 0.15:
+        p.dynamic_eq = dyn.DynamicEqParams(enabled=True, bands=[
+            dyn.DynamicEqBand(
+                enabled=True, freq=6800.0, q=1.4,
+                gain_db=round(-2.5 * c, 2),
+                threshold_db=-30.0, ratio=2.0,
+                attack_ms=5.0, release_ms=120.0,
+                direction="above", max_reduction_db=round(5.0 * c, 1))])
+
+    # -- dynamics --------------------------------------------------------
+    if tight > 0.02:
+        p.compressor = dyn.CompressorParams(
+            enabled=True,
+            threshold_db=float(-14.0 - 10.0 * tight),
+            ratio=float(1.0 + 1.4 * tight),
+            attack_ms=20.0 - 8.0 * tight,
+            release_ms=200.0 - 40.0 * tight,
+            knee_db=10.0, detector="rms",
+            mix=float(np.clip(0.25 + 0.4 * tight, 0.0, 0.75)),
+            makeup_db=0.0)
+    if c > 0.25:
+        p.multiband = dyn.MultibandParams(
+            enabled=True, crossovers_hz=[180.0, 2400.0],
+            bands=[
+                dyn.CompressorParams(enabled=True, threshold_db=-22.0,
+                                     ratio=float(1.0 + 0.6 * c), attack_ms=25.0,
+                                     release_ms=200.0, mix=round(0.6 * c, 2)),
+                dyn.CompressorParams(enabled=True, threshold_db=-21.0,
+                                     ratio=float(1.0 + 0.7 * c), attack_ms=18.0,
+                                     release_ms=170.0, mix=round(0.55 * c, 2)),
+                dyn.CompressorParams(enabled=True, threshold_db=-26.0,
+                                     ratio=float(1.0 + 0.5 * c), attack_ms=10.0,
+                                     release_ms=140.0, mix=round(0.4 * c, 2))])
+
+    # -- harmonic texture -------------------------------------------------
+    if c > 0.1:
+        p.saturation = nl.SaturationParams(
+            enabled=True, shaper="tanh", drive_db=round(3.0 * c, 2),
+            mix=round(0.12 * c, 3), oversample=4, compensate="rms")
+
+    # -- image -------------------------------------------------------------
+    if c > 0.2:
+        p.stereo = st.StereoParams(enabled=True, width=round(1.0 + 0.12 * c, 3))
+
+    p.output_trim_db = s.output_trim_db
+    p.loudness_match = True
+    p.loudness_match_mode = "lufs"
+    p.limiter = dyn.LimiterParams(enabled=True, ceiling_db=s.ceiling_db,
+                                  lookahead_ms=6.0)
+    return p
+
+
 def default_profile_path() -> str | None:
     """Location of the shipped default profile, if it exists."""
     env = os.environ.get("TIMBREFORGE_PROFILE")

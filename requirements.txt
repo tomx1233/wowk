@@ -1,10 +1,21 @@
 # Timbreforge runtime dependencies
+#
+#   python -m pip install -r requirements.txt
+#
 numpy>=1.24
 scipy>=1.10
 soundfile>=0.12          # libsndfile bindings: WAV / FLAC / Ogg Vorbis / MP3
-PySide6-Essentials>=6.5  # Qt 6 widgets (full PySide6 also works and adds QtMultimedia)
 
-# optional, only for the analysis tools and the report figures
+# Qt 6 widgets.  IMPORTANT: PySide6-Essentials does NOT contain Qt Multimedia,
+# which is why playback was silent on some machines in earlier versions.  Audio
+# output now goes through sounddevice first, so Essentials is enough - but the
+# full `PySide6` package is also fine and adds the Qt Multimedia fallback.
+PySide6-Essentials>=6.5
+
+# Audio output (PortAudio).  Required: this is the primary preview/playback
+# backend.  Without it the app still renders and exports, and offers
+# "Audition in player" instead of in-app monitoring.
+sounddevice>=0.4.6
+
+# Optional: only for the analysis tools and the report figures
 matplotlib>=3.7          # tools/analyze_pair.py --figures, tools/render_example.py
-# sounddevice>=0.4       # fallback audio output if Qt Multimedia is unavailable
-

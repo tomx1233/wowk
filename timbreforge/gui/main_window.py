@@ -1,32 +1,43 @@
-"""Main window: import, audition, adjust, export."""
+"""Main window: import, audition, adjust, export.
+
+Rules the window enforces
+-------------------------
+* nothing expensive runs on the UI thread: decoding, measuring, rendering,
+  export and the audition fallback all happen in :mod:`timbreforge.gui.workers`;
+* a parameter change is debounced and an older render is cancelled rather than
+  queued, so dragging a slider cannot build up a backlog of work;
+* preview and export call the same ``dsp.graph.render`` - there is no second
+  "preview-only" code path that could sound different from the export;
+* playback is optional.  If no audio backend exists, the window offers to render
+  the preview region and hand it to the system's own player instead.
+"""
 
 from __future__ import annotations
 
 import json
 import os
-import time
-import traceback
 
 import numpy as np
-from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QGuiApplication, QIcon, QKeySequence
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
-                               QFileDialog, QFrame, QGridLayout, QHBoxLayout,
-                               QLabel, QLineEdit, QMainWindow, QMessageBox,
-                               QProgressBar, QPushButton, QSizePolicy, QSplitter,
-                               QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QFileDialog, QFrame,
+                               QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+                               QMainWindow, QMessageBox, QProgressBar, QPushButton,
+                               QSizePolicy, QSplitter, QToolButton, QVBoxLayout,
+                               QWidget)
 
 from .. import APP_NAME, APP_SUBTITLE, __version__
-from ..dsp.audio import AudioData, AudioError, IMPORT_FILTER, load_audio
-from ..dsp.graph import Profile, RenderResult
-from ..dsp.meter import (Stats, integrated_loudness, measure, rms_db, db,
-                         true_peak)
+from ..dsp.audio import (IMPORT_FILTER, AudioData, AudioError, format_for_extension,
+                         load_audio)
+from ..dsp.audio_limits import check_export, check_import, check_loaded, describe_limits
+from ..dsp.graph import Profile
+from ..dsp.meter import Stats, measure
 from .export_dialog import ExportDialog
 from .panel import ProcessingPanel
 from .player import AudioPlayer
-from .theme import COLORS
 from .widgets import LevelMeter, WaveformWidget
-from .workers import ExportWorker, RenderWorker
+from .workers import (AuditionWorker, ExportWorker, ImportWorker, RenderPayload,
+                      RenderWorker)
 
 PREVIEW_WINDOW_S = 30.0
 LONG_FILE_THRESHOLD_S = 45.0
@@ -48,19 +59,20 @@ class MainWindow(QMainWindow):
         self.audio: AudioData | None = None
         self._stats_in: Stats | None = None
         self._stats_out: Stats | None = None
+        self._payload: RenderPayload | None = None
         self._proc: np.ndarray | None = None
         self._orig_clip: np.ndarray | None = None
-        self._result: RenderResult | None = None
+        self._play_array: np.ndarray | None = None
         self._region = (0, 0)
-        self._cache: dict[str, RenderResult] = {}
+        self._cache: dict[str, RenderPayload] = {}
         self._worker: RenderWorker | None = None
+        self._import_worker: ImportWorker | None = None
         self._export_worker: ExportWorker | None = None
+        self._audition_worker: AuditionWorker | None = None
+        self._audition_tmp: str | None = None
         self._pending_play = False
         self._rerun = False
         self._ab = "processed"
-        self._ab_match = True
-        self._gain_proc = 0.0
-        self._gain_orig = 0.0
         self._whole_file_preview = False
         self._busy_reason = ""
         self._last_dir = os.path.expanduser("~")
@@ -68,11 +80,11 @@ class MainWindow(QMainWindow):
         self.player = AudioPlayer(self)
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
-        self._debounce.setInterval(420)
+        self._debounce.setInterval(300)
         self._debounce.timeout.connect(lambda: self._start_render(play_after=False))
 
         self._meter_timer = QTimer(self)
-        self._meter_timer.setInterval(60)
+        self._meter_timer.setInterval(50)
         self._meter_timer.timeout.connect(self._tick_meters)
 
         self._build_ui()
@@ -80,12 +92,20 @@ class MainWindow(QMainWindow):
         self._build_menus()
         self._connect()
         self._set_idle_ui()
-        self.statusBar().showMessage("Ready \u2014 import a file to begin.", 8000)
+        self.statusBar().showMessage(
+            f"Ready \u2014 audio output: {self.player.backend_name}", 12000)
 
+    # ==================================================================
+    # startup
+    # ==================================================================
     def _load_startup_profile(self):
-        """Start from the shipped profile so a plain import already sounds right."""
-        from ..dsp.graph import default_profile_path
-        path = default_profile_path()
+        """Load a profile only when one is named explicitly.
+
+        The default start is the **simple** view: five controls that generate a
+        profile.  A full profile is loaded when ``TIMBREFORGE_PROFILE`` points at
+        one, which is what the CLI and the tests use.
+        """
+        path = os.environ.get("TIMBREFORGE_PROFILE") or None
         if not path:
             return
         try:
@@ -114,11 +134,11 @@ class MainWindow(QMainWindow):
         split.addWidget(self._build_left())
         self.panel = ProcessingPanel()
         self.panel.setMinimumWidth(470)
-        self.panel.setMaximumWidth(620)
+        self.panel.setMaximumWidth(640)
         split.addWidget(self.panel)
         split.setStretchFactor(0, 1)
         split.setStretchFactor(1, 0)
-        split.setSizes([880, 520])
+        split.setSizes([860, 520])
         outer.addWidget(split, 1)
 
         self._progress = QProgressBar()
@@ -129,7 +149,15 @@ class MainWindow(QMainWindow):
         self._cancel_btn.setObjectName("Ghost")
         self._cancel_btn.setVisible(False)
         self._cancel_btn.clicked.connect(self._cancel_jobs)
+        self._audition_btn = QPushButton("Audition in player")
+        self._audition_btn.setObjectName("Ghost")
+        self._audition_btn.setVisible(False)
+        self._audition_btn.setToolTip(
+            "No audio output backend was found. Render the preview region and open it in "
+            "your system's audio player.")
+        self._audition_btn.clicked.connect(self._audition)
         self.statusBar().addPermanentWidget(self._progress, 1)
+        self.statusBar().addPermanentWidget(self._audition_btn)
         self.statusBar().addPermanentWidget(self._cancel_btn)
         self.statusBar().setSizeGripEnabled(True)
 
@@ -244,6 +272,10 @@ class MainWindow(QMainWindow):
                                  "Attenuation only, never a boost.")
         transport.addWidget(self.match_cb)
         transport.addStretch(1)
+        self.backend_label = QLabel(self._backend_text())
+        self.backend_label.setObjectName("Faint")
+        self.backend_label.setToolTip(self.player.backend_name)
+        transport.addWidget(self.backend_label)
         self.time_label = QLabel("0:00.00 / 0:00.00")
         self.time_label.setObjectName("Mono")
         transport.addWidget(self.time_label)
@@ -269,6 +301,7 @@ class MainWindow(QMainWindow):
         meter_box.addWidget(self.meter)
         self.meter_note = QLabel("")
         self.meter_note.setObjectName("Faint")
+        self.meter_note.setWordWrap(True)
         meter_box.addWidget(self.meter_note)
         ml.addLayout(meter_box, 1)
 
@@ -344,8 +377,16 @@ class MainWindow(QMainWindow):
         a_clear = QAction("Clear &selection", self)
         a_clear.setShortcut("Esc")
         a_clear.triggered.connect(lambda: self.wave.set_selection(None))
+        a_tone = QAction("&Test audio output", self)
+        a_tone.triggered.connect(self.test_output)
+        a_aud = QAction("&Audition preview in system player", self)
+        a_aud.setShortcut("Ctrl+Shift+P")
+        a_aud.triggered.connect(self._audition)
         m_view.addAction(a_fit)
         m_view.addAction(a_clear)
+        m_view.addSeparator()
+        m_view.addAction(a_tone)
+        m_view.addAction(a_aud)
 
         m_tools = mb.addMenu("&Analysis")
         a_pair = QAction("&Reference pair analysis\u2026", self)
@@ -372,6 +413,7 @@ class MainWindow(QMainWindow):
         self.player.stateChanged.connect(self._on_player_state)
         self.player.playbackError.connect(self._on_player_error)
         self.player.finished.connect(self._on_player_finished)
+        self.player.backendChanged.connect(self._on_backend_changed)
 
     # ==================================================================
     # import
@@ -385,53 +427,73 @@ class MainWindow(QMainWindow):
         self.load_file(path)
 
     def load_file(self, path: str):
-        QGuiApplication.setOverrideCursor(Qt.WaitCursor)
-        self.statusBar().showMessage(f"Decoding {os.path.basename(path)}\u2026")
-        QApplication.processEvents()
-        try:
-            audio = load_audio(path)
-        except AudioError as exc:
-            QGuiApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "Could not import", str(exc))
-            self.statusBar().showMessage("Import failed.", 6000)
+        """Decode + measure in a worker thread, then render the first preview."""
+        verdict = check_import(path)
+        if verdict.errors:
+            QMessageBox.warning(self, "Could not import", "\n".join(verdict.errors))
             return
-        except Exception as exc:  # noqa: BLE001
-            QGuiApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "Unexpected import error",
-                                 f"{exc}\n\n{traceback.format_exc(limit=2)}")
-            return
-        finally:
-            try:
-                QGuiApplication.restoreOverrideCursor()
-            except Exception:  # noqa: BLE001
-                pass
+        for w in verdict.warnings:
+            self.statusBar().showMessage(w, 8000)
+
+        if self._import_worker is not None and self._import_worker.isRunning():
+            self._import_worker.cancel()
+            self._import_worker.wait(2000)
 
         self._stop_all()
+        self._pending_play = False
+        worker = ImportWorker(path, self)
+        worker.progress.connect(self._on_import_progress)
+        worker.done.connect(self._on_import_done)
+        worker.failed.connect(self._on_import_failed)
+        worker.finished.connect(lambda: setattr(self, "_import_worker", None))
+        self._import_worker = worker
+        self._set_busy(True, f"Opening {os.path.basename(path)}\u2026")
+        worker.start()
+
+    def _on_import_progress(self, frac: float, label: str):
+        self._progress.setValue(int(frac * 1000))
+        self.statusBar().showMessage(f"{label}\u2026", 2000)
+
+    def _on_import_failed(self, msg: str):
+        self._set_busy(False)
+        self.statusBar().showMessage("Import failed.", 8000)
+        QMessageBox.warning(self, "Could not import", msg)
+
+    def _on_import_done(self, audio: AudioData, stats: Stats):
+        self._set_busy(False)
+        verdict = check_loaded(audio.frames, audio.sample_rate, audio.channels)
+        if verdict.errors:
+            QMessageBox.warning(self, "Could not use this file", "\n".join(verdict.errors))
+            return
+
         self.audio = audio
-        self._last_dir = os.path.dirname(audio.path or "")
-        self._cache.clear()
-        self._proc = None
-        self._result = None
+        self._stats_in = stats
         self._stats_out = None
-        self._ab = "processed"
-        self.ab_b.setChecked(True)
+        self._payload = None
+        self._proc = None
+        self._orig_clip = None
+        self._play_array = None
+        self._cache.clear()
+        self._region = (0, audio.frames)
+        self._last_dir = os.path.dirname(audio.path or "") or self._last_dir
+
+        self.player.configure_source(audio.sample_rate, audio.channels)
+        self.backend_label.setText(self._backend_text())
+        self.backend_label.setToolTip(self.player.backend_name)
+        self._audition_btn.setVisible(not self.player.available)
+
         self.wave.set_audio(audio.samples, None, audio.sample_rate)
+        self.wave.set_playhead(0.0)
         self.panel.set_sample_rate(audio.sample_rate)
         self._update_file_info()
         for w in (self.export_btn, self.play_btn, self.ab_a, self.ab_b):
             w.setEnabled(True)
-
-        self.statusBar().showMessage("Measuring input\u2026")
-        QApplication.processEvents()
-        try:
-            self._stats_in = measure(audio.samples, audio.sample_rate)
-        except Exception:  # noqa: BLE001
-            self._stats_in = None
-            traceback.print_exc()
         self._refresh_stats()
 
-        if audio.warnings:
-            QMessageBox.information(self, "Imported with notes", "\n\n".join(audio.warnings))
+        notes = list(audio.warnings) + list(verdict.warnings)
+        if notes:
+            QMessageBox.information(self, "Imported with notes", "\n\n".join(notes))
+
         self._start_render(play_after=False)
         self.statusBar().showMessage(
             f"Loaded {audio.filename} \u00b7 {audio.duration:.2f} s \u00b7 "
@@ -489,19 +551,23 @@ class MainWindow(QMainWindow):
 
     def _cache_key(self, region: tuple[int, int]) -> str:
         prof = json.dumps(self.panel.profile().to_dict(), sort_keys=True)
+        dev = self.player.device_format
         return (f"{hash(prof)}:{region[0]}:{region[1]}:"
                 f"{self.audio.sample_rate if self.audio else 0}:"
+                f"{dev.sample_rate}:{dev.channels}:{dev.dtype}:"
                 f"{self._preview_target_loudness()}")
 
     def _on_profile_changed(self):
         if self.audio is None:
             return
+        # debounce: a slider drag should produce one render, not thirty
         self._debounce.start()
 
     def _on_profile_replaced(self):
         self._cache.clear()
         if self.audio is None:
             return
+        self._debounce.stop()
         self._start_render(play_after=False)
 
     def _on_whole_toggle(self, on: bool):
@@ -513,6 +579,7 @@ class MainWindow(QMainWindow):
         if self.audio is None:
             return
         if self._worker is not None and self._worker.isRunning():
+            # supersede: cancel the stale render, run once more when it exits
             self._rerun = True
             self._worker.cancel()
             self._pending_play = self._pending_play or play_after
@@ -522,7 +589,7 @@ class MainWindow(QMainWindow):
             return
         key = self._cache_key(region)
         if not force and key in self._cache:
-            self._apply_result(self._cache[key])
+            self._apply_payload(self._cache[key])
             if play_after:
                 self._begin_playback()
             return
@@ -532,6 +599,7 @@ class MainWindow(QMainWindow):
         prof = self.panel.profile()
         worker = RenderWorker(self.audio.samples, self.audio.sample_rate, prof,
                               region[0], region[1], self,
+                              device=self.player.device_format,
                               target_loudness=self._preview_target_loudness())
         worker.progress.connect(self._on_render_progress)
         worker.done.connect(self._on_render_done)
@@ -548,39 +616,33 @@ class MainWindow(QMainWindow):
         self._progress.setValue(int(frac * 1000))
         self.statusBar().showMessage(f"{label}\u2026", 2000)
 
-    def _on_render_done(self, result: RenderResult):
-        key = self._cache_key((getattr(result, "start_frame", 0),
-                               getattr(result, "start_frame", 0) + result.frames))
-        self._cache[key] = result
-        if len(self._cache) > 8:
-            for k in list(self._cache)[:-8]:
+    def _on_render_done(self, payload: RenderPayload):
+        key = self._cache_key((payload.start_frame, payload.start_frame + payload.frames))
+        self._cache[key] = payload
+        if len(self._cache) > 6:
+            for k in list(self._cache)[:-6]:
                 self._cache.pop(k, None)
-        self._apply_result(result)
+        self._apply_payload(payload)
         if self._pending_play:
             self._pending_play = False
             self._begin_playback()
 
-    def _apply_result(self, result: RenderResult):
-        start = getattr(result, "start_frame", 0)
-        self._result = result
-        self._region = (start, start + result.frames)
-        self._proc = result.samples
-        self.wave.set_processed(result.samples)
-        try:
-            self._stats_out = measure(result.samples, result.sample_rate)
-        except Exception:  # noqa: BLE001
-            self._stats_out = None
-        self._update_gain_match()
+    def _apply_payload(self, payload: RenderPayload):
+        self._payload = payload
+        self._proc = payload.samples
+        self._stats_out = payload.stats_out
+        self._region = (payload.start_frame, payload.start_frame + payload.frames)
+        if self.audio is not None:
+            self._orig_clip = self.audio.samples[self._region[0]:self._region[1]]
+        self.wave.set_processed(payload.samples)
         self._refresh_stats()
-        self._refresh_region_label()
-        if result.warnings:
-            self.meter_note.setText(result.warnings[-1])
+        if payload.warnings:
+            self.meter_note.setText(payload.warnings[-1])
         else:
             self.meter_note.setText("")
         self._set_busy(False)
         if self._ab == "processed":
-            self.player.set_buffer(self._proc_for_player(), self.audio.sample_rate
-                                   if self.audio else 44100)
+            self._install_buffer(keep_position=True)
 
     def _on_render_failed(self, msg: str):
         self._set_busy(False)
@@ -611,67 +673,50 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Cancelling\u2026", 3000)
         if self._export_worker is not None and self._export_worker.isRunning():
             self._export_worker.cancel()
+        if self._audition_worker is not None and self._audition_worker.isRunning():
+            self._audition_worker.cancel()
 
     # ==================================================================
     # playback
     # ==================================================================
-    def _proc_for_player(self) -> np.ndarray | None:
-        if self._proc is None:
-            return None
-        if self._ab_match and abs(self._gain_proc) > 0.01:
-            return self._proc * (10 ** (self._gain_proc / 20.0))
-        return self._proc
+    def _backend_text(self) -> str:
+        b = self.player.backend
+        if b == "sd":
+            return "output: sounddevice"
+        if b == "qt":
+            return "output: Qt Multimedia"
+        return "output: none (export only)"
 
-    def _orig_for_player(self) -> np.ndarray | None:
-        if self._orig_clip is None:
-            return None
-        if self._ab_match and abs(self._gain_orig) > 0.01:
-            return self._orig_clip * (10 ** (self._gain_orig / 20.0))
-        return self._orig_clip
+    def _gain_for(self, mode: str) -> float:
+        p = self._payload
+        if p is None or not self.match_cb.isChecked():
+            return 0.0
+        return p.gain_proc_db if mode == "processed" else p.gain_orig_db
 
-    def _update_gain_match(self):
-        self._gain_proc = 0.0
-        self._gain_orig = 0.0
-        if not (self._ab_match and self._proc is not None and self._orig_clip is not None):
+    def _install_buffer(self, *, keep_position: bool = True):
+        p = self._payload
+        if p is None:
             return
-        try:
-            lo = integrated_loudness(self._orig_clip, self.audio.sample_rate)
-            lp = integrated_loudness(self._proc, self.audio.sample_rate)
-        except Exception:  # noqa: BLE001
+        buf = p.play_processed if self._ab == "processed" else p.play_original
+        if buf is None:
             return
-        d = lo - lp
-        if d < 0:
-            self._gain_proc = d          # processed is louder -> attenuate it
-        else:
-            self._gain_orig = -d         # input is louder -> attenuate it
+        self._play_array = buf.as_array()
+        self.player.set_buffer(buf, keep_position=keep_position,
+                               gain_db=self._gain_for(self._ab))
 
     def _set_ab(self, mode: str):
         if mode == self._ab:
             return
         self._ab = mode
         (self.ab_a if mode == "original" else self.ab_b).setChecked(True)
-        if self.audio is None:
+        if self.audio is None or self._payload is None:
             return
-        if mode == "original":
-            if self._orig_clip is None:
-                region = self._preview_region()
-                self._region = region
-                self._orig_clip = self.audio.samples[region[0]:region[1]]
-            self.player.set_buffer(self._orig_for_player(), self.audio.sample_rate)
-        else:
-            if self._proc is None:
-                self._start_render(play_after=self.player.is_playing())
-                return
-            self.player.set_buffer(self._proc_for_player(), self.audio.sample_rate)
+        self._install_buffer(keep_position=True)
         self._refresh_stats()
 
     def _on_match_toggle(self, on: bool):
-        self._ab_match = bool(on)
-        self._update_gain_match()
-        if self.audio is not None:
-            buf = self._proc_for_player() if self._ab == "processed" else self._orig_for_player()
-            if buf is not None:
-                self.player.set_buffer(buf, self.audio.sample_rate)
+        if self._payload is not None:
+            self.player.set_gain_db(self._gain_for(self._ab))
         self._refresh_stats()
 
     def _on_play_pause(self):
@@ -685,24 +730,74 @@ class MainWindow(QMainWindow):
     def _begin_playback(self):
         if self.audio is None:
             return
-        if self._ab == "processed" and self._proc is None:
+        if self._payload is None:
             self._start_render(play_after=True)
             return
-        buf = self._proc_for_player() if self._ab == "processed" else self._orig_for_player()
-        if buf is None:
-            return
         if not self.player.available:
-            QMessageBox.information(
-                self, "No audio output",
-                "No playback device was found in this environment, so audio monitoring is "
-                "disabled.\n\nThe processing, preview rendering and export all still work; "
-                "export and listen in any player.\n\nOn Linux install libportaudio2 (or use "
-                "a full PySide6 build with Qt Multimedia) to enable monitoring.")
+            self._offer_audition()
             return
-        self.player.set_buffer(buf, self.audio.sample_rate)
+        self._install_buffer(keep_position=False)
         offset = max(0.0, self.wave.playhead() - self._region[0] / self.audio.sample_rate)
         self.player.play(offset)
         self._meter_timer.start()
+
+    def _offer_audition(self):
+        """No backend: offer to render the region and open it in the OS player."""
+        if self._audition_btn.isVisible():
+            self._audition()
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("No audio output backend")
+        box.setText("This environment has no audio output that the app can use.")
+        box.setInformativeText(
+            "You can still audition: the app will render the preview region to a "
+            "temporary WAV file and open it in your system's audio player.\n\n"
+            "Details: " + self.player.backend_name)
+        box.setStandardButtons(QMessageBox.Open | QMessageBox.Close)
+        box.button(QMessageBox.Open).setText("Audition in player")
+        if box.exec() == QMessageBox.Open:
+            self._audition()
+
+    def _audition(self):
+        if self.audio is None:
+            return
+        if self._payload is None:
+            self._start_render(play_after=True)
+            return
+        if self._audition_worker is not None and self._audition_worker.isRunning():
+            return
+        s, e = self._region
+        worker = AuditionWorker(self.audio.samples, self.audio.sample_rate,
+                                self.panel.profile(), s, e, self)
+        worker.progress.connect(self._on_render_progress)
+        worker.done.connect(self._on_audition_ready)
+        worker.failed.connect(self._on_render_failed)
+        worker.finished.connect(lambda: setattr(self, "_audition_worker", None))
+        self._audition_worker = worker
+        self._set_busy(True, "Rendering for audition\u2026")
+        worker.start()
+
+    def _on_audition_ready(self, path: str):
+        self._set_busy(False)
+        self._audition_tmp = path
+        if self.player.open_in_system_player(path):
+            self.statusBar().showMessage(
+                "Opened the rendered preview in your system audio player.", 10000)
+        else:
+            QMessageBox.information(
+                self, "Preview rendered",
+                f"The preview was rendered to:\n\n{path}\n\nOpen it with any audio player.")
+
+    def test_output(self):
+        if self.player.available and self.player.play_test_tone():
+            self.statusBar().showMessage(
+                f"Playing a short test tone through {self.player.backend_name}.", 8000)
+        else:
+            QMessageBox.information(
+                self, "No audio output",
+                "No playback device could be opened.\n\n" + self.player.backend_name +
+                "\n\nThe processing, preview rendering and export all still work. Use "
+                "\u201cAudition preview in system player\u201d (Ctrl+Shift+P) to listen.")
 
     def _on_stop(self):
         self.player.stop()
@@ -725,7 +820,7 @@ class MainWindow(QMainWindow):
         if not (region_start <= t <= region_end) and not self._whole_file_preview:
             self._debounce.stop()
             self._start_render(play_after=self.player.is_playing())
-        elif self.player.is_playing() or self.player.position() > 0:
+        elif self.player.buffer is not None:
             self.player.seek(max(0.0, t - region_start))
 
     def _on_selection(self, sel):
@@ -734,9 +829,11 @@ class MainWindow(QMainWindow):
             self._debounce.start()
 
     def _on_playback_position(self, pos: float):
-        if self.audio is None:
+        if self.audio is None or self.player.buffer is None:
             return
         offset = self._region[0] / self.audio.sample_rate
+        if self.player.buffer.resampled:
+            offset = self._region[0] / self.audio.sample_rate
         self.wave.set_playhead(offset + pos)
         self.time_label.setText(f"{self._fmt(offset + pos)} / {self._fmt(self.audio.duration)}")
 
@@ -750,25 +847,31 @@ class MainWindow(QMainWindow):
                 self._meter_timer.stop()
 
     def _on_player_error(self, msg: str):
-        self.statusBar().showMessage(msg, 10000)
+        self._meter_timer.stop()
+        self.statusBar().showMessage(msg, 12000)
+        self._audition_btn.setVisible(True)
+
+    def _on_backend_changed(self):
+        self._audition_btn.setVisible(not self.player.available)
+        if hasattr(self, "backend_label"):
+            self.backend_label.setText(self._backend_text())
+            self.backend_label.setToolTip(self.player.backend_name)
 
     def _on_player_finished(self):
         self._meter_timer.stop()
-        self.wave.set_playhead(self.wave.playhead())
 
     def _tick_meters(self):
-        if self.audio is None:
+        arr = self._play_array
+        buf = self.player.buffer
+        if arr is None or buf is None or not self.player.is_playing():
             return
-        buf = self._proc_for_player() if self._ab == "processed" else self._orig_for_player()
-        if buf is None or not self.player.is_playing():
-            return
-        sr = self.audio.sample_rate
-        t = self.player.position()
-        s = int(max(0, (t - 0.6) * sr))
-        e = min(buf.shape[0], s + int(0.06 * sr))
+        rate = max(1, buf.format.sample_rate)
+        i = int(self.player.position() * rate)
+        s = max(0, i - int(0.60 * rate))
+        e = min(arr.shape[0], i + int(0.06 * rate))
         if e <= s:
             return
-        self.meter.set_levels(self._channel_levels(buf[s:e]))
+        self.meter.set_levels(self._channel_levels(arr[s:e]))
 
     @staticmethod
     def _fmt(seconds: float) -> str:
@@ -782,16 +885,19 @@ class MainWindow(QMainWindow):
     # ==================================================================
     def _refresh_stats(self):
         si, so = self._stats_in, self._stats_out
+
         def put(key, text_in, text_out, delta=""):
             a, b, d = self._stat_labels[key]
             a.setText(text_in)
             b.setText(text_out)
             d.setText(delta)
+
         if si is None:
             for key in self._stat_labels:
                 put(key, "\u2014", "\u2014")
         else:
-            put("peak", f"{si.true_peak_db:+.1f}", f"{so.true_peak_db:+.1f}" if so else "\u2014",
+            put("peak", f"{si.true_peak_db:+.1f}",
+                f"{so.true_peak_db:+.1f}" if so else "\u2014",
                 f"{so.true_peak_db - si.true_peak_db:+.1f}" if so else "")
             put("rms", f"{si.rms_db:+.1f}", f"{so.rms_db:+.1f}" if so else "\u2014",
                 f"{so.rms_db - si.rms_db:+.1f}" if so else "")
@@ -801,27 +907,33 @@ class MainWindow(QMainWindow):
                 f"{so.crest_db - si.crest_db:+.1f}" if so else "")
             put("corr", f"{si.correlation:.2f}", f"{so.correlation:.2f}" if so else "\u2014",
                 f"{so.correlation - si.correlation:+.2f}" if so else "")
-        buf = None
-        if self._ab == "processed" and self._proc is not None:
-            buf = self._proc_for_player()
-        elif self._orig_clip is not None:
-            buf = self._orig_for_player()
-        if buf is not None:
-            self.meter.set_levels(self._channel_levels(buf))
-        elif si is not None:
-            self.meter.set_levels([(si.rms_db, si.peak_db, si.true_peak_db)] * 2)
+
+        p = self._payload
+        if not self.player.is_playing():
+            if p is not None and self._ab == "processed":
+                self.meter.set_levels(p.levels_out)
+            elif p is not None:
+                self.meter.set_levels(p.levels_in)
+            elif si is not None:
+                self.meter.set_levels([(si.rms_db, si.peak_db, si.true_peak_db)] * 2)
         self._refresh_region_label()
 
     @staticmethod
     def _channel_levels(buf: np.ndarray) -> list[tuple[float, float, float]]:
-        """Per-channel (RMS, peak, true-peak) in dB, cheap enough for the UI."""
+        """Per-channel (RMS, peak, peak-hold) in dB, cheap enough for 20 fps."""
+        if buf.ndim == 1:
+            buf = buf[:, None]
         out = []
-        n_ch = 2
-        for c in range(n_ch):
+        for c in range(2):
             ch = buf[:, min(c, buf.shape[1] - 1)]
-            rms = float(np.sqrt(np.mean(ch * ch))) if ch.size else 0.0
-            pk = float(np.max(np.abs(ch))) if ch.size else 0.0
-            out.append((float(db(rms, -60.0)), float(db(pk, -60.0)), float(db(pk, -60.0))))
+            if ch.size == 0:
+                out.append((-60.0, -60.0, -60.0))
+                continue
+            rms = float(np.sqrt(np.mean(ch * ch)))
+            pk = float(np.max(np.abs(ch)))
+            r = float(20.0 * np.log10(max(rms, 1e-6)))
+            k = float(20.0 * np.log10(max(pk, 1e-6)))
+            out.append((max(r, -60.0), max(k, -60.0), max(k, -60.0)))
         return out
 
     def _refresh_region_label(self):
@@ -830,9 +942,9 @@ class MainWindow(QMainWindow):
             return
         sr = self.audio.sample_rate
         s, e = self._region
-        sel = self.wave.selection()
         txt = (f"Previewing {self._fmt(s / sr)} \u2013 {self._fmt(e / sr)} "
                f"({(e - s) / sr:.1f} s)")
+        sel = self.wave.selection()
         if sel:
             txt += "  \u00b7 selection"
         elif e - s < self.audio.frames:
@@ -841,10 +953,16 @@ class MainWindow(QMainWindow):
             txt += "  \u00b7 whole file"
         stages = self.panel.profile().active_stages()
         txt += "  \u00b7  stages: " + (", ".join(stages) if stages else "none (bypass)")
-        if self._gain_proc < -0.01:
-            txt += f"  \u00b7  A/B matched: processed {-self._gain_proc:.1f} dB down"
-        elif self._gain_orig < -0.01:
-            txt += f"  \u00b7  A/B matched: input {-self._gain_orig:.1f} dB down"
+        p = self._payload
+        if p is not None:
+            if self._ab == "processed" and p.gain_proc_db < -0.01:
+                txt += f"  \u00b7  A/B matched: processed {-p.gain_proc_db:.1f} dB down"
+            elif self._ab == "original" and p.gain_orig_db < -0.01:
+                txt += f"  \u00b7  A/B matched: input {-p.gain_orig_db:.1f} dB down"
+            if self._stats_out is not None:
+                ceil = self.panel.profile().limiter.ceiling_db
+                head = ceil - self._stats_out.true_peak_db
+                txt += f"  \u00b7  {head:+.1f} dB below the {ceil:+.0f} dBTP ceiling"
         self.region_label.setText(txt)
 
     # ==================================================================
@@ -863,6 +981,19 @@ class MainWindow(QMainWindow):
         if dlg.exec() != ExportDialog.Accepted:
             return
         settings = dlg.settings()
+        try:
+            fmt = settings.format or format_for_extension(settings.path)[0]
+        except AudioError as exc:
+            QMessageBox.warning(self, "Export settings", str(exc))
+            return
+        verdict = check_export(
+            path=settings.path, fmt=fmt,
+            sample_rate=int(settings.sample_rate or self.audio.sample_rate),
+            frames=self.audio.frames, channels=self.audio.channels,
+            subtype=settings.subtype, source_path=self.audio.path)
+        if verdict.errors:
+            QMessageBox.warning(self, "Export settings", "\n".join(verdict.errors))
+            return
         self.player.pause()
         worker = ExportWorker(self.audio, self.panel.profile(), settings, self)
         worker.progress.connect(self._on_export_progress)
@@ -982,10 +1113,11 @@ class MainWindow(QMainWindow):
             "\u2022 no pitch shift, tempo change, time-stretch or varispeed\n"
             "\u2022 no loudness maximisation: the render is matched to the input's loudness, "
             "never above it, unless you raise Output trim yourself\n"
-            "\u2022 -1 dBTP true-peak ceiling checked on the encoded export\n"
+            "\u2022 \u22121 dBTP true-peak ceiling checked on the encoded export\n"
             "\u2022 stereo width touches only the side signal, so mono fold-down is preserved\n"
             "\u2022 original files are never overwritten\n\n"
-            "Preview and export use the same engine (timbreforge.dsp.graph.render).")
+            "Preview and export use the same engine (timbreforge.dsp.graph.render).\n\n"
+            "Limits:\n" + describe_limits())
 
     # ==================================================================
     # events
@@ -994,7 +1126,8 @@ class MainWindow(QMainWindow):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
                 ext = os.path.splitext(url.toLocalFile())[1].lower()
-                if ext in (".wav", ".flac", ".ogg", ".oga", ".mp3", ".aiff", ".aif"):
+                if ext in (".wav", ".flac", ".ogg", ".oga", ".mp3", ".aiff", ".aif",
+                           ".opus", ".m4a"):
                     event.acceptProposedAction()
                     return
         event.ignore()
@@ -1013,13 +1146,17 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event):  # noqa: N802
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.cancel()
-            self._worker.wait(3000)
-        if self._export_worker is not None and self._export_worker.isRunning():
-            self._export_worker.cancel()
-            self._export_worker.wait(3000)
+        for attr in ("_worker", "_export_worker", "_audition_worker", "_import_worker"):
+            w = getattr(self, attr, None)
+            if w is not None and w.isRunning():
+                w.cancel()
+                w.wait(3000)
         self.player.shutdown()
+        if self._audition_tmp and os.path.exists(self._audition_tmp):
+            try:
+                os.remove(self._audition_tmp)
+            except OSError:
+                pass
         super().closeEvent(event)
 
     def _set_idle_ui(self):
@@ -1028,3 +1165,4 @@ class MainWindow(QMainWindow):
         self.ab_a.setEnabled(False)
         self.ab_b.setEnabled(False)
         self.meter.set_levels([(-60, -60, -60)] * 2)
+        self._audition_btn.setVisible(not self.player.available)
