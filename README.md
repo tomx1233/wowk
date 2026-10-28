@@ -211,6 +211,25 @@ The same analysis is available inside the app under `Analysis ▸ Reference pair
 analysis…`, where it can also fit a starting-point EQ profile from the measured
 apparent transfer.
 
+### Recovering an edit someone else made
+
+`tools/pair_match.py` is the narrow tool for "these two files differ only by a
+speed/pitch change — what exactly was done?". It estimates the pitch and tempo
+factor between them, validates both estimators on controls built from the
+original on every run (resample-only, and resample + WSOLA, accurate to ~20 ppm),
+and prints the Audacity macro that reproduces the edit:
+
+```bash
+python3 tools/pair_match.py originalfile.ogg ModifiedFile.ogg \
+    --out-dir analysis/pair --figures
+```
+
+It also reports the audio span of each file (so leading/trailing silence cannot
+be mistaken for a speed change), the level residual, the pitch-compensated tone
+residual, and the bandwidth of each source. A worked example, including how to
+tell a real equaliser move from a codec/source difference, is in
+`docs/PAIR_MATCH.md`.
+
 What the analysis reports, and why each part exists:
 
 * **same recording?** — normalised correlation at the measured lag, per-segment
@@ -271,10 +290,12 @@ timbreforge/
               player.py  workers.py  export_dialog.py  analysis_dialog.py  theme.py
   cli.py      headless render / measure / compare
 tools/        make_demo.py  analyze_pair.py  compare_methods.py  render_example.py
+              pair_match.py  (estimate an external pitch/tempo edit)
 profiles/     neutral_level_matched.json  gentle_character.json  reference_character.json
 examples/     demo render, level-matched A/B, validation report, spectrograms
 docs/         ANALYSIS.md (findings vs hypotheses)  METHODS.md (families tested)
-tests/        test_dsp.py  test_analyze.py  test_gui_smoke.py
+              PAIR_MATCH.md (worked pitch/tempo recovery)
+tests/        test_dsp.py  test_analyze.py  test_playback.py  test_gui_sim.py
 ```
 
 ---
