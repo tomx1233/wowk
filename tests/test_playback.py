@@ -22,7 +22,8 @@ from timbreforge.dsp.audio_limits import (check_export, check_import, check_load
                                           describe_limits, rate_is_supported)
 from timbreforge.dsp.graph import SimpleSettings, profile_from_simple, render
 from timbreforge.dsp.meter import integrated_loudness, measure
-from timbreforge.dsp.playback import (DeviceFormat, PlaybackBuffer, pick_device_format,
+from timbreforge.dsp.playback import (DeviceFormat, PlaybackBuffer, _to_dtype,
+                                      apply_gain_bytes, pick_device_format,
                                       prepare_playback, silence_buffer, test_tone)
 
 FAILS: list[str] = []
@@ -119,6 +120,27 @@ def test_buffer_read():
     end = buf.read(len(buf.data) - 8, 16)
     check(len(end) == 8, "reading past the end returns only what is left")
     check(buf.read(len(buf.data), 16) == b"", "reading at the end returns nothing")
+
+
+def test_gain_bytes():
+    print("\n[read-path gain]")
+    for dtype in ("float32", "int16", "int32"):
+        raw = _to_dtype(np.array([[0.5, -0.25], [0.9, -1.0]]), dtype).tobytes()
+        half = apply_gain_bytes(raw, dtype, 0.5)
+        np_dtype = np.dtype(dtype)
+        before = np.frombuffer(raw, dtype=np_dtype).astype(np.float64)
+        after = np.frombuffer(half, dtype=np_dtype).astype(np.float64)
+        full = {"float32": 1.0, "int16": 32767.0, "int32": 2147483647.0}[dtype]
+        err = float(np.max(np.abs(after / full - 0.5 * before / full)))
+        # integer formats round to their own grid; float32 cannot hold an int32
+        # sample exactly, so the tolerance follows the format's own resolution
+        tol = max(2e-7, 2.0 / full)
+        check(err < tol, f"{dtype}: gain halves the signal (max error {err:.2e})")
+        check(len(half) == len(raw), f"{dtype}: byte length is preserved")
+    loud = _to_dtype(np.array([[0.9], [-0.9]]), "int16").tobytes()
+    boosted = np.frombuffer(apply_gain_bytes(loud, "int16", 4.0), dtype=np.int16)
+    check(int(np.abs(boosted).max()) == 32767, "int16 boost clips instead of wrapping")
+    check(apply_gain_bytes(b"", "float32", 0.5) == b"", "empty input is passed through")
 
 
 def test_aux_buffers():
@@ -254,6 +276,7 @@ def main():
     test_device_format()
     test_prepare_playback()
     test_buffer_read()
+    test_gain_bytes()
     test_aux_buffers()
     test_limits()
     test_simple_profile()

@@ -86,6 +86,31 @@ def _to_dtype(x: np.ndarray, dtype: str) -> np.ndarray:
     raise ValueError(f"unsupported playback sample type {dtype!r}")
 
 
+_FULL_SCALE = {"float32": 1.0, "int16": 32767.0, "int32": 2147483647.0}
+
+
+def apply_gain_bytes(data: bytes, dtype: str, gain_linear: float) -> bytes:
+    """Scale a block of device-format audio in place-ish, without changing dtype.
+
+    The naive version of this (multiply the raw samples, clip to +/-1) silently
+    destroys integer output: an int16 sample of 20000 became 1.  Integer formats
+    are therefore decoded to the -1..1 domain, scaled, clipped and re-encoded.
+    """
+    if gain_linear == 1.0 or not data:
+        return data
+    full = _FULL_SCALE.get(dtype)
+    if full is None:
+        return data
+    arr = np.frombuffer(data, dtype=np.dtype(dtype))
+    if dtype == "float32":
+        out = np.clip(arr * np.float32(gain_linear), -1.0, 1.0)
+        return out.astype(np.float32, copy=False).tobytes()
+    out = arr.astype(np.float32) / full
+    out *= np.float32(gain_linear)
+    np.clip(out, -1.0, 1.0, out=out)
+    return np.rint(out * full).astype(np.dtype(dtype)).tobytes()
+
+
 @dataclass
 class PlaybackBuffer:
     """A ready-to-stream buffer in the output device's format."""

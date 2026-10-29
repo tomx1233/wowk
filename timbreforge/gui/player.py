@@ -28,7 +28,8 @@ import weakref
 import numpy as np
 from PySide6.QtCore import QIODevice, QObject, Qt, QTimer, Signal
 
-from ..dsp.playback import DeviceFormat, PlaybackBuffer, prepare_playback, test_tone
+from ..dsp.playback import (DeviceFormat, PlaybackBuffer, apply_gain_bytes,
+                            prepare_playback, test_tone)
 
 #: Upper bound for the transient monitor gain used while a trim change is
 #: still being rendered.  Monitoring may never go louder than this.
@@ -330,9 +331,7 @@ class AudioPlayer(QObject):
         want = self._fmt.frames_to_bytes(max(1, frames))
         chunk = self._buffer.read(self._byte_pos, want)
         if chunk and self._gain_linear != 1.0:
-            arr = np.frombuffer(chunk, dtype=self._fmt.dtype).astype(np.float32)
-            arr *= np.float32(self._gain_linear)
-            chunk = np.clip(arr, -1.0, 1.0).astype(self._fmt.dtype).tobytes()
+            chunk = apply_gain_bytes(chunk, self._fmt.dtype, self._gain_linear)
         self._byte_pos += len(chunk)
         done = self._byte_pos >= len(self._buffer.data)
         if done:
