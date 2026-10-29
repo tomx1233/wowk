@@ -6,7 +6,7 @@ exports it.  It never substitutes or mixes in a reference recording, never
 changes pitch or tempo, and is not a loudness maximiser.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 APP_NAME = "Timbreforge"
 APP_SUBTITLE = "Audio character processor"
 SCHEMA_VERSION = 1

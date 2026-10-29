@@ -10,6 +10,19 @@ pitch, tempo or speed changes, and **without** becoming a loudness maximiser.
 
 ---
 
+## What changed in 1.2
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The window stuttered whenever anything moved, worst during playback | the waveform was redrawn by scanning the whole file, for both the input and the processed copy, on **every** repaint - and the playhead repainted ~25 times a second, so a 3-minute file meant ~100 M samples scanned per second | drawing now reads a block peak grid that is built once per file (`timbreforge/dsp/peaks.py`): **376 ms -> 0.009 ms** per repaint, with zoomed views still exact. The playhead also repaints only its own two-pixel strip instead of the whole widget |
+| Playback volume replied late (a slider change was heard seconds later, with a gap) | every finished render closed and reopened the audio stream (`stop()`/`start()`), and the stream was also restarted on every seek | the player now swaps the buffer under a running stream and seeks by moving the read cursor, so the stream is opened once per playback. The output trim additionally goes through a temporary read-path gain, so it is audible immediately while the render that bakes it in is still running |
+| The pitch/tempo recovery was impossible to find | it was a command-line tool plus a report file | it is now **in the window**: `Analysis > Pitch/tempo of two files...`, **Ctrl+T**, or the *Pitch/tempo...* button in the top bar. Copy the macro to the clipboard or save it as a file for Audacity's Macro Manager. The measurement also got 20x faster (two-stage tempo search) and can be cancelled |
+
+The measurement is still read-only: the processing chain has no pitch or tempo
+control, and nothing the tool finds is applied to exported audio.
+
+---
+
 ## What changed in 1.1 (and what was wrong in 1.0)
 
 1.0 shipped three problems the release notes did not admit to:
@@ -213,11 +226,20 @@ apparent transfer.
 
 ### Recovering an edit someone else made
 
-`tools/pair_match.py` is the narrow tool for "these two files differ only by a
-speed/pitch change — what exactly was done?". It estimates the pitch and tempo
-factor between them, validates both estimators on controls built from the
-original on every run (resample-only, and resample + WSOLA, accurate to ~20 ppm),
-and prints the Audacity macro that reproduces the edit:
+**In the app:** `Analysis ▸ Pitch/tempo of two files…` (or **Ctrl+T**, or the
+**Pitch/tempo…** button in the top bar). Pick the original and the modified file,
+press *Measure*, and the window prints the pitch and tempo percentages, the
+Audacity macro that reproduces them, the level/tone residual and the self-check
+that proves the numbers. *Copy macro* puts it on the clipboard, *Save macro…*
+writes a file you can import into Audacity's Macro Manager. Nothing it measures
+is applied to the audio the app exports — the processing chain still has no pitch
+or tempo control.
+
+The same measurement is available headless, and it is the tool behind
+`docs/PAIR_MATCH.md`. `tools/pair_match.py` estimates the pitch and tempo factor
+between two files, validates both estimators on controls built from the original
+on every run (resample-only, and resample + WSOLA, accurate to ~20 ppm), and
+prints the Audacity macro that reproduces the edit:
 
 ```bash
 python3 tools/pair_match.py originalfile.ogg ModifiedFile.ogg \
@@ -291,11 +313,14 @@ timbreforge/
   cli.py      headless render / measure / compare
 tools/        make_demo.py  analyze_pair.py  compare_methods.py  render_example.py
               pair_match.py  (estimate an external pitch/tempo edit)
+macros/       Audacity macros recovered from a pair (ModifiedFile.txt)
 profiles/     neutral_level_matched.json  gentle_character.json  reference_character.json
 examples/     demo render, level-matched A/B, validation report, spectrograms
 docs/         ANALYSIS.md (findings vs hypotheses)  METHODS.md (families tested)
               PAIR_MATCH.md (worked pitch/tempo recovery)
+timbreforge/dsp/pairmatch.py   the measurement engine behind all of the above
 tests/        test_dsp.py  test_analyze.py  test_playback.py  test_gui_sim.py
+              test_pair_tool.py
 ```
 
 ---

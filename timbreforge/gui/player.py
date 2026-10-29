@@ -30,6 +30,10 @@ from PySide6.QtCore import QIODevice, QObject, Qt, QTimer, Signal
 
 from ..dsp.playback import DeviceFormat, PlaybackBuffer, prepare_playback, test_tone
 
+#: Upper bound for the transient monitor gain used while a trim change is
+#: still being rendered.  Monitoring may never go louder than this.
+MONITOR_BOOST_MAX_DB = 6.0
+
 
 class AudioPlayer(QObject):
     """Streams a :class:`PlaybackBuffer` to the default output device."""
@@ -194,13 +198,21 @@ class AudioPlayer(QObject):
         """The buffer currently installed (already in the device format)."""
         return self._buffer
 
-    def set_gain_db(self, gain_db: float):
-        """Instant A/B attenuation, applied in the read path.
+    def set_gain_db(self, gain_db: float, *, allow_boost: bool = False):
+        """Instant gain in the read path (no re-render, no stream restart).
 
-        Only attenuation is used by the UI (level-matched A/B), so this cannot
-        silently make monitoring louder than the rendered file.
+        The plain call only attenuates: the level-matched A/B must never make
+        monitoring louder than the rendered file.  ``allow_boost`` exists for the
+        short-lived monitor trim (see :meth:`MainWindow._on_profile_changed`),
+        which anticipates a re-render that is already on its way; even then the
+        boost is capped, so a slider drag cannot push the output into clipping
+        before the limiter has seen it.
         """
-        g = float(min(0.0, gain_db))
+        g = float(gain_db)
+        if not allow_boost:
+            g = min(0.0, g)
+        else:
+            g = float(np.clip(g, -60.0, MONITOR_BOOST_MAX_DB))
         self._gain_db = g
         self._gain_linear = 10.0 ** (g / 20.0)
 
@@ -214,9 +226,19 @@ class AudioPlayer(QObject):
     # ------------------------------------------------------------------
     # buffer handling
     # ------------------------------------------------------------------
+    def stream_running(self) -> bool:
+        return self._sd_stream is not None or self._qt_sink is not None
+
     def set_buffer(self, buffer: PlaybackBuffer | None, *, keep_position: bool = True,
                    fade_in: bool = True, gain_db: float | None = None):
-        """Install a prepared buffer.  Cheap: no audio processing happens here."""
+        """Install a prepared buffer.  Cheap: no audio processing happens here.
+
+        While audio is playing the stream is *not* torn down: the callback picks
+        up the new buffer on its next block.  Closing and reopening PortAudio on
+        every preview render is what made the app feel like the volume arrived
+        seconds late, so the buffer is swapped in place instead (the first few
+        milliseconds are ramped to avoid a click).
+        """
         was_playing = self._playing
         pos_s = self.position() if keep_position else 0.0
         if gain_db is not None:
@@ -224,7 +246,10 @@ class AudioPlayer(QObject):
         if buffer is not None and fade_in and was_playing:
             # re-render the first milliseconds with a ramp so the swap is silent
             buffer = self._with_ramp(buffer)
-        if was_playing:
+        seamless = (was_playing and self.stream_running()
+                    and buffer is not None and self._buffer is not None
+                    and buffer.format == self._fmt)
+        if was_playing and not seamless:
             self._stop_backend()
         self._buffer = buffer
         if buffer is None:
@@ -233,7 +258,7 @@ class AudioPlayer(QObject):
             return
         self._byte_pos = int(np.clip(pos_s * self._fmt.sample_rate, 0,
                                      max(0, buffer.frames - 1))) * self._fmt.bytes_per_frame
-        if was_playing:
+        if was_playing and not seamless:
             self._start_backend()
 
     @staticmethod
@@ -279,15 +304,12 @@ class AudioPlayer(QObject):
         self._set_state("stopped")
 
     def seek(self, seconds: float):
+        """Move the read cursor.  The stream keeps running, so scrubbing is instant."""
         if self._buffer is None:
             return
-        was = self._playing
-        self._stop_backend()
         self._byte_pos = int(np.clip(seconds * self._fmt.sample_rate, 0,
                                      max(0, self._buffer.frames - 1))
                              ) * self._fmt.bytes_per_frame
-        if was:
-            self._start_backend()
 
     def shutdown(self):
         self._stop_backend()

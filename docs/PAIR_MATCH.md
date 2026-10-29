@@ -20,8 +20,15 @@ ChangeTempo: Percentage=5.06
 ```
 
 Import in Audacity: **Tools ▸ Macros… ▸ New**, then **Import…** and pick
-`analysis/pair/macro.txt` (or just type the two lines with **Insert**). Apply to the
-whole track. If you prefer the fields by hand: *Change Pitch → Percentage Change* = 5.18,
+`macros/ModifiedFile.txt` from this repo (or `analysis/pair/macro.txt` after a run,
+or just type the two lines with **Insert**). Apply to the whole track.
+
+**In the app:** `Analysis ▸ Pitch/tempo of two files…` — Ctrl+T, or the
+*Pitch/tempo…* button in the top bar. It runs this measurement on any pair and can
+copy or save the macro. That tool only measures; the processing chain itself has no
+pitch or tempo control.
+
+If you prefer the fields by hand: *Change Pitch → Percentage Change* = 5.18,
 *Change Tempo → Percentage Change* = 5.06. Order does not matter — pitch and tempo
 commute here.
 

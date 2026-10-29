@@ -63,6 +63,7 @@ class MainWindow(QMainWindow):
         self._proc: np.ndarray | None = None
         self._orig_clip: np.ndarray | None = None
         self._play_array: np.ndarray | None = None
+        self._play_array_buf = None
         self._region = (0, 0)
         self._cache: dict[str, RenderPayload] = {}
         self._worker: RenderWorker | None = None
@@ -72,6 +73,9 @@ class MainWindow(QMainWindow):
         self._audition_tmp: str | None = None
         self._pending_play = False
         self._rerun = False
+        # gain applied on top of the rendered buffer while a trim change is still
+        # being rendered; always returns to 0 when that render lands
+        self._monitor_trim_db = 0.0
         self._ab = "processed"
         self._whole_file_preview = False
         self._busy_reason = ""
@@ -80,7 +84,7 @@ class MainWindow(QMainWindow):
         self.player = AudioPlayer(self)
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
-        self._debounce.setInterval(300)
+        self._debounce.setInterval(220)
         self._debounce.timeout.connect(lambda: self._start_render(play_after=False))
 
         self._meter_timer = QTimer(self)
@@ -192,6 +196,15 @@ class MainWindow(QMainWindow):
         self.chip_ch = _chip("\u2014")
         for c in (self.chip_format, self.chip_rate, self.chip_ch, self.chip_len):
             lay.addWidget(c)
+
+        self.pair_btn = QPushButton("Pitch/tempo\u2026")
+        self.pair_btn.setObjectName("Ghost")
+        self.pair_btn.setToolTip(
+            "Work out what pitch and tempo change turned one file into another, and get "
+            "the Audacity settings that reproduce it (Ctrl+T). Measurement only \u2014 "
+            "this app never changes pitch or tempo.")
+        lay.addWidget(self.pair_btn)
+        lay.addSpacing(6)
 
         self.export_btn = QPushButton("Export\u2026")
         self.export_btn.setObjectName("Primary")
@@ -389,10 +402,15 @@ class MainWindow(QMainWindow):
         m_view.addAction(a_aud)
 
         m_tools = mb.addMenu("&Analysis")
+        a_pt = QAction("&Pitch/tempo of two files\u2026", self)
+        a_pt.setShortcut("Ctrl+T")
+        a_pt.setStatusTip("Recover the pitch and tempo change between two files")
+        a_pt.triggered.connect(self.open_pair_tool)
         a_pair = QAction("&Reference pair analysis\u2026", self)
         a_pair.triggered.connect(self.open_analysis)
         a_about = QAction("&Guide / about\u2026", self)
         a_about.triggered.connect(self.show_about)
+        m_tools.addAction(a_pt)
         m_tools.addAction(a_pair)
         m_tools.addSeparator()
         m_tools.addAction(a_about)
@@ -400,6 +418,7 @@ class MainWindow(QMainWindow):
     def _connect(self):
         self.import_btn.clicked.connect(self.import_dialog)
         self.export_btn.clicked.connect(self.export_dialog)
+        self.pair_btn.clicked.connect(self.open_pair_tool)
         self.play_btn.clicked.connect(self._on_play_pause)
         self.stop_btn.clicked.connect(self._on_stop)
         self.ab_a.clicked.connect(lambda: self._set_ab("original"))
@@ -560,6 +579,18 @@ class MainWindow(QMainWindow):
     def _on_profile_changed(self):
         if self.audio is None:
             return
+        # The output trim is the one control whose effect is pure gain, so show it
+        # immediately through the player's read-path gain instead of waiting for
+        # the render.  The render follows and takes the temporary gain back out.
+        p = self._payload
+        if p is not None:
+            want = float(getattr(self.panel.profile(), "output_trim_db", 0.0))
+            delta = want - float(p.trim_db)
+            if abs(delta) > 0.05:
+                self._monitor_trim_db = delta
+                if self.player.is_playing():
+                    self.player.set_gain_db(self._gain_for(self._ab) + delta,
+                                            allow_boost=True)
         # debounce: a slider drag should produce one render, not thirty
         self._debounce.start()
 
@@ -629,6 +660,7 @@ class MainWindow(QMainWindow):
 
     def _apply_payload(self, payload: RenderPayload):
         self._payload = payload
+        self._monitor_trim_db = 0.0
         self._proc = payload.samples
         self._stats_out = payload.stats_out
         self._region = (payload.start_frame, payload.start_frame + payload.frames)
@@ -700,9 +732,13 @@ class MainWindow(QMainWindow):
         buf = p.play_processed if self._ab == "processed" else p.play_original
         if buf is None:
             return
-        self._play_array = buf.as_array()
+        # decoding the buffer for the meter is an 11 MB copy per render; keep the
+        # last one as long as the buffer it came from is still installed
+        if self._play_array_buf is not buf or self._play_array is None:
+            self._play_array = buf.as_array()
+            self._play_array_buf = buf
         self.player.set_buffer(buf, keep_position=keep_position,
-                               gain_db=self._gain_for(self._ab))
+                               gain_db=self._gain_for(self._ab) + self._monitor_trim_db)
 
     def _set_ab(self, mode: str):
         if mode == self._ab:
@@ -716,7 +752,8 @@ class MainWindow(QMainWindow):
 
     def _on_match_toggle(self, on: bool):
         if self._payload is not None:
-            self.player.set_gain_db(self._gain_for(self._ab))
+            self.player.set_gain_db(self._gain_for(self._ab) + self._monitor_trim_db,
+                                    allow_boost=self._monitor_trim_db > 0)
         self._refresh_stats()
 
     def _on_play_pause(self):
@@ -867,8 +904,10 @@ class MainWindow(QMainWindow):
             return
         rate = max(1, buf.format.sample_rate)
         i = int(self.player.position() * rate)
-        s = max(0, i - int(0.60 * rate))
-        e = min(arr.shape[0], i + int(0.06 * rate))
+        # a short look-back: the meter should follow the music, not lag 0.6 s
+        # behind it (which read as "the volume display is slow")
+        s = max(0, i - int(0.20 * rate))
+        e = min(arr.shape[0], i + int(0.03 * rate))
         if e <= s:
             return
         self.meter.set_levels(self._channel_levels(arr[s:e]))
@@ -1103,6 +1142,18 @@ class MainWindow(QMainWindow):
         if self.audio is not None:
             self._start_render(play_after=False)
 
+    def open_pair_tool(self):
+        """Open the read-only pitch/tempo recovery tool.
+
+        Imported here rather than at module scope so the window still starts on a
+        Qt build where only the basic widgets exist.
+        """
+        from .pair_dialog import PairDialog
+
+        current = self.audio.path if self.audio is not None else ""
+        dlg = PairDialog(self, loaded=current or "")
+        dlg.exec()
+
     def show_about(self):
         QMessageBox.information(
             self, f"About {APP_NAME}",
@@ -1117,6 +1168,12 @@ class MainWindow(QMainWindow):
             "\u2022 stereo width touches only the side signal, so mono fold-down is preserved\n"
             "\u2022 original files are never overwritten\n\n"
             "Preview and export use the same engine (timbreforge.dsp.graph.render).\n\n"
+            "Measuring somebody else's edit:\n"
+            "Analysis \u203a Pitch/tempo of two files\u2026 (Ctrl+T, or the Pitch/tempo "
+            "button in the top bar) takes an original and a modified file and reports "
+            "the pitch and tempo change between them, plus the Audacity macro that "
+            "reproduces it. That is a measurement tool: nothing it finds is applied to "
+            "the audio you export.\n\n"
             "Limits:\n" + describe_limits())
 
     # ==================================================================

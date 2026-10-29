@@ -114,6 +114,8 @@ class RenderPayload:
     play_processed: PlaybackBuffer | None = None
     play_original: PlaybackBuffer | None = None
     reports: list = field(default_factory=list)
+    #: output trim that is already baked into ``samples`` (0 dB if it was bypassed)
+    trim_db: float = 0.0
 
     @property
     def frames(self) -> int:
@@ -194,6 +196,7 @@ class RenderWorker(_CancellableThread):
                 play_processed=play_proc,
                 play_original=play_orig,
                 reports=result.reports,
+                trim_db=float(getattr(self._profile, "output_trim_db", 0.0)),
             )
             self._emit(1.0, "Done")
             self.done.emit(payload)

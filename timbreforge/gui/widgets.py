@@ -12,6 +12,7 @@ from PySide6.QtGui import (QBrush, QColor, QFont, QLinearGradient, QPainter,
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from ..dsp.biquad import Band, magnitude_db
+from ..dsp.peaks import PeakCache
 from .theme import COLORS
 
 
@@ -44,6 +45,11 @@ class WaveformWidget(QWidget):
         self._orig: np.ndarray | None = None
         self._proc: np.ndarray | None = None
         self._sr = 44100
+        # Drawing reads one peak per pixel from these caches.  Building one is a
+        # single O(n) pass per array; every repaint after that is O(pixels), so
+        # moving the playhead no longer rescans the whole file.
+        self._peaks_in = PeakCache()
+        self._peaks_out = PeakCache()
         self._dur = 1.0
         self._t0 = 0.0
         self._t1 = 1.0
@@ -59,6 +65,8 @@ class WaveformWidget(QWidget):
         self._orig = orig
         self._proc = proc
         self._sr = int(sr) if sr else 44100
+        self._peaks_in.set(orig, self._sr)
+        self._peaks_out.set(proc, self._sr)
         dur = 0.0
         for arr in (orig, proc):
             if arr is not None and len(arr):
@@ -68,11 +76,8 @@ class WaveformWidget(QWidget):
         self.update()
 
     def set_processed(self, proc: np.ndarray | None):
-        if proc is not None and self._orig is not None and len(proc) != len(self._orig):
-            # keep the widget honest about length rather than silently stretching
-            self._proc = proc
-        else:
-            self._proc = proc
+        self._proc = proc
+        self._peaks_out.set(proc, self._sr)
         self.update()
 
     def show_input(self, on: bool):
@@ -98,9 +103,16 @@ class WaveformWidget(QWidget):
 
     def set_playhead(self, t: float):
         t = float(np.clip(t, 0.0, self._dur))
-        if abs(t - self._playhead) > 1e-4:
-            self._playhead = t
-            self.update()
+        if abs(t - self._playhead) <= 1e-4:
+            return
+        old, self._playhead = self._playhead, t
+        # Repaint only the two thin strips the playhead left and entered.  A full
+        # repaint on every position tick is what made playback feel sluggish.
+        r = self._plot_rect()
+        xs = [self._time_to_x(old), self._time_to_x(t)]
+        for x in xs:
+            if r.left() - 4 <= x <= r.right() + 4:
+                self.update(int(x) - 3, int(r.top()) - 2, 7, int(r.height()) + 5)
 
     def playhead(self) -> float:
         return self._playhead
@@ -139,26 +151,6 @@ class WaveformWidget(QWidget):
         span = max(self._t1 - self._t0, 1e-9)
         return float(np.clip(self._t0 + (x - r.left()) / r.width() * span, 0.0, self._dur))
 
-    def _envelope(self, x: np.ndarray, width: int) -> np.ndarray:
-        n = x.shape[0]
-        i0 = int(max(0, self._t0 * self._sr))
-        i1 = int(min(n, self._t1 * self._sr))
-        if i1 <= i0 or width < 2:
-            return np.zeros(max(2, width))
-        seg = x[i0:i1]
-        mono = np.abs(seg).max(axis=1) if seg.ndim > 1 else np.abs(seg)
-        if mono.size <= width:
-            return np.interp(np.linspace(0, mono.size - 1, width), np.arange(mono.size), mono)
-        edges = np.linspace(0, mono.size, width + 1).astype(np.int64)
-        edges = np.unique(np.clip(edges, 0, mono.size - 1))
-        if edges.size < 2:
-            return np.zeros(width)
-        peaks = np.maximum.reduceat(mono, edges[:-1])
-        if peaks.size != width:
-            peaks = np.interp(np.linspace(0, 1, width), np.linspace(0, 1, peaks.size), peaks)
-        return peaks
-
-    # -- painting ---------------------------------------------------------
     def paintEvent(self, event):  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
@@ -204,11 +196,11 @@ class WaveformWidget(QWidget):
         p.setClipRect(r)
 
         if self._show_input and self._orig is not None:
-            env = self._envelope(self._orig, width)
+            env = self._peaks_in.envelope(self._t0, self._t1, width)
             self._draw_shape(p, r, env, QColor(COLORS["wave_in"]))
 
         if self._proc is not None:
-            env = self._envelope(self._proc, width)
+            env = self._peaks_out.envelope(self._t0, self._t1, width)
             col = QColor(COLORS["wave_out"])
             col.setAlpha(235)
             self._draw_shape(p, r, env, col)

@@ -4,7 +4,7 @@ Part of the headless GUI simulation (tests/test_gui_sim.py).  It exists so the
 real widget/worker code can be executed on a machine with no Qt platform
 libraries; it is never imported by the application itself.
 """
-from .QtCore import QObject, Signal, QTimer, _Const, _Namespace
+from .QtCore import QObject, QRectF, Signal, QTimer, _Const, _Namespace
 from .QtGui import QAction, QIcon
 
 
@@ -77,8 +77,13 @@ class _Widget(QObject):
             w, h = w.width(), w.height()
         self._width, self._height = int(w), int(h)
 
-    def update(self):
+    def update(self, *args):
+        # Qt accepts update() and update(x, y, w, h) for a partial repaint; the
+        # app uses both, so the double has to accept both.
         pass
+
+    def rect(self):
+        return QRectF(0, 0, self.width(), self.height())
 
     def setLayout(self, lay):
         self._layout = lay
